@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" style="position:fixed;top:0;left:0">
+  <foreignObject x="0" y="0" width="100%" height="100%">
+    <body xmlns="http://www.w3.org/1999/xhtml" style="margin:0">
+      <iframe id="arctic-embed-frame" allow="fullscreen" style="position:fixed;inset:0;width:100%;height:100%;border:none"></iframe>
+      <script><![CDATA[
+        (function(){
+          function dec(b){var s=atob(b);var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return new TextDecoder().decode(a);}
+          var frame=document.getElementById("arctic-embed-frame");
+          var html=dec("PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9InV0Zi04IiAvPgogICAgPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIiIC8+CiAgICA8bWV0YSBuYW1lPSJjb2xvci1zY2hlbWUiIGNvbnRlbnQ9ImxpZ2h0IGRhcmsiIC8+CiAgICA8bWV0YSBodHRwLWVxdWl2PSJDYWNoZS1Db250cm9sIiBjb250ZW50PSJuby1zdG9yZSIgLz4KICAgIDx0aXRsZT5Mb2FkaW5n4oCmPC90aXRsZT4KICAgIDxsaW5rIHJlbD0iaWNvbiIgaHJlZj0iLi9mYXZpY29uLnN2ZyIgdHlwZT0iaW1hZ2Uvc3ZnK3htbCIgLz4KICAgIDxzY3JpcHQgdHlwZT0ibW9kdWxlIiBjcm9zc29yaWdpbiBzcmM9Ii4vYXNzZXRzL2VtYmVkLUNjSWhHWDFZLmpzIj48L3NjcmlwdD4KICAgIDxsaW5rIHJlbD0ibW9kdWxlcHJlbG9hZCIgY3Jvc3NvcmlnaW4gaHJlZj0iLi9hc3NldHMvcmVzb2x2ZXItRDVhQjVPZEkuanMiPgogICAgPGxpbmsgcmVsPSJzdHlsZXNoZWV0IiBjcm9zc29yaWdpbiBocmVmPSIuL2Fzc2V0cy9zdHlsZS1CcW80ZU0zbi5jc3MiPgogIDwvaGVhZD4KICA8Ym9keT4KICAgIDxkaXYgaWQ9ImVtYmVkLXJvb3QiPgogICAgICA8ZGl2IGlkPSJlbWJlZC1zdGFnZSI+CiAgICAgICAgPHN2ZyBpZD0iZW1iZWQtbWFyayIgd2lkdGg9IjUyIiBoZWlnaHQ9IjUyIiB2aWV3Qm94PSIwIDAgNDAwIDQwMCIgYXJpYS1oaWRkZW49InRydWUiPgogICAgICAgICAgPGcgc3Ryb2tlPSJ2YXIoLS1hY2NlbnQpIiBzdHJva2Utd2lkdGg9IjciIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgZmlsbD0ibm9uZSI+CiAgICAgICAgICAgIDxwYXRoIGQ9Ik0yMDAgNDAgTDIwMCAzNjAgTTYwIDEyMCBMMzQwIDI4MCBNMzQwIDEyMCBMNjAgMjgwIiBvcGFjaXR5PSIwLjkiIC8+CiAgICAgICAgICAgIDxwYXRoIGQ9Ik0yMDAgNDAgTDE3NiA3MCBNMjAwIDQwIEwyMjQgNzAgTTIwMCAzNjAgTDE3NiAzMzAgTTIwMCAzNjAgTDIyNCAzMzAiIC8+CiAgICAgICAgICA8L2c+CiAgICAgICAgPC9zdmc+CiAgICAgICAgPGRpdiBpZD0iZW1iZWQtc3Bpbm5lciI+PC9kaXY+CiAgICAgICAgPGRpdiBpZD0iZW1iZWQtc3RlcCI+c3RhcnRpbmfigKY8L2Rpdj4KICAgICAgPC9kaXY+CiAgICAgIDxkaXYgaWQ9ImVtYmVkLWJhciI+PC9kaXY+CiAgICAgIDxpZnJhbWUKICAgICAgICBpZD0iZW1iZWQtZnJhbWUiCiAgICAgICAgYWxsb3c9ImF1dG9wbGF5OyBmdWxsc2NyZWVuOyBjbGlwYm9hcmQtcmVhZDsgY2xpcGJvYXJkLXdyaXRlOyBlbmNyeXB0ZWQtbWVkaWE7IHBpY3R1cmUtaW4tcGljdHVyZSIKICAgICAgPjwvaWZyYW1lPgogICAgICA8ZGl2IGlkPSJlbWJlZC1lcnJvciIgaGlkZGVuPgogICAgICAgIDxoMiBpZD0iZW1iZWQtZXJyb3ItdGl0bGUiPkNvdWxkbuKAmXQgbG9hZCB0aGF0IHBhZ2U8L2gyPgogICAgICAgIDxwIGlkPSJlbWJlZC1lcnJvci1tc2ciPjwvcD4KICAgICAgICA8YnV0dG9uIGlkPSJlbWJlZC1yZXRyeSIgdHlwZT0iYnV0dG9uIj5UcnkgYWdhaW48L2J1dHRvbj4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICA8L2JvZHk+CjwvaHRtbD4K");
+          var base=new URL("./",location.href).href.replace(/\/+$/,"");
+          var origins=["https://cdn.jsdelivr.net/gh/sealiee11/arctic-static@main","https://testingcf.jsdelivr.net/gh/sealiee11/arctic-static@main","https://gcore.jsdelivr.net/gh/sealiee11/arctic-static@main","https://cdn.statically.io/gh/sealiee11/arctic-static@main","https://esm.sh/gh/sealiee11/arctic-static@main"];
+          var p=new URLSearchParams(location.search);
+          var h=location.hash.slice(1);
+          var directNetworkUrlAllowed=(function directNetworkUrlAllowed(value        , hasBackend         )          {
+  const directProtocols = new Set(['http:', 'https:', 'ws:', 'wss:'])
+  const apiHost = String.fromCharCode(97, 114, 99, 116, 105, 99, 46, 108, 97, 116)
+  const ownerWispPaths = new Set(['/_q/', '/wisp/'])
+  try {
+    const url = new URL(value)
+    if (!directProtocols.has(url.protocol)) return false
+    if (hasBackend) return true
+    const hostname = url.hostname.toLowerCase().replace(/\.+$/, '')
+    if (hostname === apiHost) {
+      return url.protocol === 'wss:' && url.search === '' && url.hash === '' && ownerWispPaths.has(url.pathname)
+    }
+    return !hostname.endsWith(`.${apiHost}`)
+  } catch {
+    return false
+  }
+});
+          function targetOf(v){if(v.slice(0,4)==="aw1."){try{var q=v.slice(4).replace(/-/g,"+").replace(/_/g,"/"),s=atob(q+"=".repeat((4-q.length%4)%4)),a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return new TextDecoder().decode(a)}catch(e){return ""}}if(v.slice(0,4)!=="rv3."){try{return decodeURIComponent(v)}catch(e){return v}}try{var q=v.slice(4),k=[215,109,196,84,233,61,142,52,178,73,201,25],a=new Uint8Array(q.length/2);if(!/^(?:[0-9a-f]{2})+$/i.test(q))return "";for(var i=0;i<a.length;i++)a[i]=parseInt(q.slice(i*2,i*2+2),16)^(k[i%k.length]^((41+(i%k.length)*17)&255))^((41+i*29)&255);return new TextDecoder("utf-8",{fatal:true}).decode(a)}catch(e){return ""}}
+          var target=h?targetOf(h):(p.get("url")||"");
+          var route=p.get("r")||"",pinned=route?targetOf(route):(p.get("wisp")||"");if(!directNetworkUrlAllowed(pinned,false))pinned="";
+          var attempt=-1,idle=0,maximum=0,settled=false,lastChance=false,progressCount=0,generation=0,frameGeneration=0,retrying=false,probe=null;
+          function clearTimers(){clearTimeout(idle);clearTimeout(maximum);idle=0;maximum=0}
+          function clearProbe(){if(probe){probe.abort();probe=null}}
+          function send(data){if(window.parent!==window)window.parent.postMessage(data,"*")}
+          function arm(g){if(settled||g!==generation)return;clearTimeout(idle);idle=setTimeout(function(){fail(g)},45000)}
+          function start(index){if(settled||retrying)return;retrying=true;clearTimers();clearProbe();generation++;tryOrigin(index,generation)}
+          function fail(g){if(settled||g!==generation)return;start(attempt+1)}
+          function resetFrame(){var next=frame.cloneNode(false);frame.replaceWith(next);frame=next}
+          window.addEventListener("message",function(e){if(!frame||e.source!==frame.contentWindow||frameGeneration!==generation)return;var d=e.data||{};if(d.type!=="arctic-embed")return;if(d.status==="ready"){settled=true;retrying=false;clearTimers();clearProbe();send(d)}else if(d.status==="progress"){if(typeof d.count==="number"&&d.count>progressCount){progressCount=d.count;arm(frameGeneration)}send(d)}else if(d.status==="navigate"){send(d)}else if(d.status==="wisp-failed"){settled=true;retrying=false;clearTimers();clearProbe();send(d)}else if(d.status==="error"){fail(frameGeneration)}});
+          origins=origins.filter(function(origin){return origin.replace(/\/+$/,'')!==base});origins.unshift(base);
+          function inject(origin,index,g){if(g!==generation||settled)return;attempt=index;settled=false;retrying=false;progressCount=0;clearTimers();clearProbe();resetFrame();frameGeneration=g;var head='<base href="'+origin+'/"/>'+'<'+'script>window.__ARCTIC_EMBED_TARGET='+JSON.stringify(target)+';window.__ARCTIC_EMBED_BACKEND='+JSON.stringify(p.get("backend")||"scramjet2")+';window.__ARCTIC_EMBED_PALETTE='+JSON.stringify(p.get("palette")||"")+';window.__ARCTIC_EMBED_WISP='+JSON.stringify(pinned)+';</'+'script>';frame.srcdoc=html.replace("<head>","<head>"+head);arm(g);maximum=setTimeout(function(){fail(g)},180000)}
+          function exhausted(g){if(g!==generation||settled)return;if(!lastChance){lastChance=true;inject(base,origins.length,g);return}settled=true;retrying=false;clearTimers();clearProbe();send({type:"arctic-embed",status:"error",detail:"no runtime could start"})}
+          function tryOrigin(index,g){if(g!==generation||settled)return;if(index>=origins.length){exhausted(g);return}var origin=origins[index].replace(/\/+$/,"");var c=new AbortController(),t=setTimeout(function(){c.abort()},5000);probe=c;fetch(origin+"/embed.html?z="+Date.now(),{cache:"no-store",mode:"cors",signal:c.signal}).then(function(r){if(!r.ok)throw new Error("runtime missing");return r.text()}).then(function(body){clearTimeout(t);if(g!==generation||settled||probe!==c)return;probe=null;if(body.indexOf('id="embed-root"')>=0)inject(origin,index,g);else tryOrigin(index+1,g)}).catch(function(){clearTimeout(t);if(g!==generation||settled||probe!==c)return;probe=null;tryOrigin(index+1,g)})}
+          start(0);
+        })();
+      ]]></script>
+    </body>
+  </foreignObject>
+</svg>
