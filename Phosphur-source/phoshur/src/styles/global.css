@@ -1,0 +1,130 @@
+@import "@fontsource-variable/google-sans-flex";
+@import "@fontsource-variable/jetbrains-mono";
+@import "./tokens.css";
+@import "./pages.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--mica-solid);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  overflow: hidden;
+}
+
+/*
+ * Mica: the tinted, pre-blurred wallpaper. The first background-image is the fallback
+ * for browsers without typed image-set(); both keep the solid color underneath.
+ */
+body,
+.mica {
+  background-color: var(--mica-solid);
+  background-image:
+    linear-gradient(var(--mica-tint), var(--mica-tint)), url("/images/mica-dark.webp");
+  background-image:
+    linear-gradient(var(--mica-tint), var(--mica-tint)),
+    image-set(
+      url("/images/mica-dark.avif") type("image/avif"),
+      url("/images/mica-dark.webp") type("image/webp")
+    );
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+:root[data-theme="light"] body,
+:root[data-theme="light"] .mica {
+  background-image:
+    linear-gradient(var(--mica-tint), var(--mica-tint)), url("/images/mica-light.webp");
+  background-image:
+    linear-gradient(var(--mica-tint), var(--mica-tint)),
+    image-set(
+      url("/images/mica-light.avif") type("image/avif"),
+      url("/images/mica-light.webp") type("image/webp")
+    );
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Every interactive element eases its colors; components add their own properties. */
+a,
+button,
+input,
+textarea,
+summary,
+[role="tab"],
+[role="combobox"],
+[role="option"],
+[role="switch"] {
+  transition-property: background-color, color, border-color, opacity, box-shadow;
+  transition-duration: var(--duration-fast);
+  transition-timing-function: var(--ease-standard);
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+* {
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
