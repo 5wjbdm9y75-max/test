@@ -1,0 +1,151 @@
+/*
+ * Phosphur design tokens: a blue Mica theme. The pre-blurred wallpaper sits behind
+ * translucent layers, so every color here is checked against the composited result.
+ * These are the only raw colors in the app; components use the tokens.
+ */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Mica: a navy tint over the blurred wallpaper, and the solid color it averages to. */
+  --mica-tint: rgb(13 22 43 / 0.7);
+  --mica-solid: #17223e;
+  --theme-color: #1b2a4a;
+
+  /* Translucent layers over the Mica. */
+  --layer: rgb(255 255 255 / 0.05);
+  --hover: rgb(255 255 255 / 0.07);
+  --pressed: rgb(255 255 255 / 0.11);
+  --field: rgb(0 0 0 / 0.2);
+  --field-hover: rgb(0 0 0 / 0.26);
+
+  /* Opaque surfaces for anything that can float over a web page. */
+  --raised: #1f2e50;
+  --raised-hover: #2a3a5f;
+
+  --border: rgb(255 255 255 / 0.1);
+  --border-strong: rgb(255 255 255 / 0.38);
+
+  --text: #e6ebf5;
+  --text-muted: #a9b4cc;
+  --text-faint: #97a3bd;
+
+  --accent: #8fb0f0;
+  --accent-fill: #4872c0;
+  --accent-fill-hover: #3e66b0;
+  /* Outlines filled controls: the fill alone is under 3:1 on a card layer. */
+  --accent-edge: #6d93dc;
+  --on-accent: #ffffff;
+
+  /* Switch tracks: both filled, so the white thumb sits the same way on each. */
+  --switch-off: #76819c;
+  --switch-on: #5b85d4;
+
+  --danger: #ff8f8f;
+  --warning: #ffc45c;
+  --success: #6fdc9c;
+  --scrim: rgb(5 10 25 / 0.55);
+  --shadow-color: 222 60% 4%;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --mica-tint: rgb(238 243 252 / 0.72);
+  --mica-solid: #d9e2f3;
+  --theme-color: #e3ebf7;
+
+  --layer: rgb(255 255 255 / 0.5);
+  --hover: rgb(15 31 69 / 0.06);
+  --pressed: rgb(15 31 69 / 0.1);
+  --field: rgb(255 255 255 / 0.7);
+  --field-hover: rgb(255 255 255 / 0.85);
+
+  --raised: #f7f9fe;
+  --raised-hover: #e8eef9;
+
+  --border: rgb(15 31 69 / 0.12);
+  --border-strong: rgb(15 31 69 / 0.52);
+
+  --text: #0f1729;
+  --text-muted: #3c4862;
+  --text-faint: #4b5773;
+
+  --accent: #30488a;
+  --accent-fill: #30488a;
+  --accent-fill-hover: #263b73;
+  --accent-edge: #30488a;
+  --on-accent: #ffffff;
+
+  --switch-off: #6b7896;
+  --switch-on: #30488a;
+
+  --danger: #b3261e;
+  --warning: #8a5a00;
+  --success: #1a7f45;
+  --scrim: rgb(15 23 41 / 0.35);
+  --shadow-color: 222 40% 25%;
+}
+
+:root {
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  /* Behind proxied pages, which expect an opaque white canvas. */
+  --webpage: #ffffff;
+
+  --shadow-lg:
+    0 12px 32px -8px hsl(var(--shadow-color) / 0.45), 0 2px 6px hsl(var(--shadow-color) / 0.25);
+
+  --font-ui:
+    "Google Sans Flex Variable", "Google Sans Flex", system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  --font-mono:
+    "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2.25rem;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* Every shared form control (inputs, buttons, selects) is this tall. */
+  --control-height: 36px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /*
+   * Motion. fast: hover, press and color changes. med: small things entering or leaving,
+   * toggles and popovers. slow: sheets, reorders and tab width changes. intro: the New Tab hero.
+   * Svelte transitions read these through src/lib/motion.ts.
+   */
+  --duration-fast: 120ms;
+  --duration-med: 200ms;
+  --duration-slow: 300ms;
+  --duration-intro: 600ms;
+  --ease-out: cubic-bezier(0.215, 0.61, 0.355, 1);
+  --ease-in: cubic-bezier(0.55, 0.055, 0.675, 0.19);
+  --ease-standard: cubic-bezier(0.645, 0.045, 0.355, 1);
+
+  --chrome-height: 84px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-med: 0ms;
+    --duration-slow: 0ms;
+    --duration-intro: 0ms;
+  }
+}

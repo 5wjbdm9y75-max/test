@@ -1,0 +1,13 @@
+.git
+.astro
+node_modules
+dist
+public/vendor
+test-results
+tests
+.github
+*.log
+Dockerfile
+docker-compose.warp.yaml
+.dockerignore
+assets
