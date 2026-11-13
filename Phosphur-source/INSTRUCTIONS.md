@@ -5,9 +5,10 @@ curl -fsSL https://bun.sh/install | bash
 ```
    2. follow the instructions to start. something like:
 ```
-to get started run:
-source /.bun/blah/blah <-- this is the important line to look for!!
-bun --version
+to get started, run:
+
+source /home/codespace/.bashrc   <-- this is the important line to look for!!
+bun --help
 ```
    3. then cd into the phosphur folder in this dir:
 ```

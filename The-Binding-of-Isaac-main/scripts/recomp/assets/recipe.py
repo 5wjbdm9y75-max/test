@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""Window recipes for version-0 KAGE archives: the writer half of
+scripts/recomp/web/recipe.js (whose header defines the format).
+
+A version-0 archive only XORs and byte-permutes its entries (archive.py raw_encode), so
+a 1 MiB window of one can be shipped as the entries' PLAIN bytes -- text that gzip then
+shrinks far better than the engine's per-1 KiB deflate, and 16-bit PCM coded here
+losslessly (FLAC's fixed predictors and Rice codes, ~62% of what the deflated archive
+ships for the game's sound effects) -- and rebuilt byte for byte by the page.
+
+    python recipe.py check <archive.a> [--windows N]    encode + decode (Python) a sample
+    python recipe.py size <archive.a>                    stored size of every window, gzipped
+
+The page side is recipe.js; tests/recomp-recipe.test.js runs both on the same windows.
+"""
+import argparse, gzip, struct, sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from archive import Archive, raw_decode, raw_keys, RAW_XOR_CONST, MASK32  # noqa: E402
+
+WINDOW = 1 << 20
+BLOCK = 4096                   # part 1's fixed block
+PCM_BLOCK = 1024               # the block window_recipe codes in (part 2 names it)
+STEREO_MODES = [0, 0, 0]       # blocks coded left/right, left/side, right/side (fixture report)
+SHIFTED = [0]                  # channel blocks coded with wasted bits (fixture report)
+
+
+# ---------------------------------------------------------------------------
+# PCM code
+
+def _residual(x, order):
+    if order == 0: return x
+    if order == 1: return x[1:] - x[:-1]
+    if order == 2: return x[2:] - 2 * x[1:-1] + x[:-2]
+    if order == 3: return x[3:] - 3 * x[2:-1] + 3 * x[1:-2] - x[:-3]
+    return x[4:] - 4 * x[3:-1] + 6 * x[2:-2] - 4 * x[1:-3] + x[:-4]
+
+
+def _parts(n):
+    q, extra = divmod(n, 4)
+    out, at = [], 0
+    for i in range(4):
+        c = q + (1 if i < extra else 0)
+        out.append((at, at + c)); at += c
+    return out
+
+
+def _rice_k(u):
+    """the cheapest Rice parameter for zigzagged residuals u (uint64) and its bit cost"""
+    if len(u) == 0:
+        return 0, 0
+    m = float(u.mean())
+    k0 = max(0, int(np.log2(m + 1)) - 1) if m > 0 else 0
+    best = None
+    for k in range(max(0, k0 - 1), min(31, k0 + 3) + 1):
+        b = int(np.sum(u >> np.uint64(k))) + len(u) * (1 + k)
+        if best is None or b < best[1]:
+            best = (k, b)
+    return best
+
+
+def _plan_channel(x, width):
+    """(cost bits, plan) for one channel of one block; plan = ('v',) or (order, [(k, u)...])"""
+    best = (3 + width * len(x), ("v",))
+    for order in range(5):
+        if len(x) <= order:
+            continue
+        r = _residual(x, order)
+        u = np.where(r >= 0, r * 2, -r * 2 - 1).astype(np.uint64)
+        cost, parts = 3 + width * order, []
+        for a, b in _parts(len(u)):
+            k, bits = _rice_k(u[a:b])
+            cost += 5 + bits
+            parts.append((k, u[a:b]))
+        if cost < best[0]:
+            best = (cost, (order, parts))
+    return best
+
+
+def _plan(x, width):
+    """_plan_channel, or ('s', shift, plan) when every sample's low `shift` bits are zero
+    (FLAC's wasted bits; recipe.js predictor 5): the block coded shifted right."""
+    best = _plan_channel(x, width)
+    orv = int(np.bitwise_or.reduce(x)) if len(x) else 0
+    if orv == 0:
+        return best
+    shift = 0
+    while shift < 15 and width - shift > 2 and not (orv >> shift) & 1:
+        shift += 1
+    if shift:
+        cost, plan = _plan_channel(x >> shift, width - shift)
+        if 7 + cost < best[0]:
+            return 7 + cost, ("s", shift, plan)
+    return best
+
+
+class _Bits:
+    """MSB-first bit writer over numpy arrays of bit values."""
+    def __init__(self):
+        self.chunks = []
+
+    def put(self, value, width):
+        if width:
+            self.chunks.append(((int(value) >> np.arange(width - 1, -1, -1)) & 1).astype(np.uint8))
+
+    def put_signed(self, values, width):
+        v = np.asarray(values, dtype=np.int64) & ((1 << width) - 1)
+        self.chunks.append(((v[:, None] >> np.arange(width - 1, -1, -1)) & 1).astype(np.uint8).ravel())
+
+    def put_rice(self, u, k):
+        if len(u) == 0:
+            return
+        q = (u >> np.uint64(k)).astype(np.int64)
+        n = len(u)
+        lens = q + 1 + k
+        starts = np.concatenate(([0], np.cumsum(lens)[:-1]))
+        bits = np.zeros(int(lens.sum()), dtype=np.uint8)
+        # unary: q ones from each start (the terminating zero is already 0)
+        if q.sum():
+            idx = np.repeat(starts, q) + (np.arange(int(q.sum())) - np.repeat(np.cumsum(q) - q, q))
+            bits[idx] = 1
+        if k:
+            low = (u & np.uint64((1 << k) - 1)).astype(np.int64)
+            lb = (low[:, None] >> np.arange(k - 1, -1, -1)) & 1
+            pos = (starts + q + 1)[:, None] + np.arange(k)
+            bits[pos.ravel()] = lb.ravel().astype(np.uint8)
+        self.chunks.append(bits)
+
+    def bytes(self):
+        if not self.chunks:
+            return b""
+        return np.packbits(np.concatenate(self.chunks)).tobytes()
+
+
+def _blocks(n, first, block=BLOCK):
+    """block bounds: a `first`-frame block (0: none) and then `block` frames each"""
+    starts = list(range(first, n, block)) if first else list(range(0, n, block))
+    if first:
+        starts = [0] + starts
+    return [(a, min(n, b)) for a, b in zip(starts, starts[1:] + [n])]
+
+
+def pcm_encode(pcm: bytes, channels: int, first: int = 0, block: int = BLOCK) -> bytes:
+    """16-bit little-endian interleaved PCM (whole frames) -> the code recipe.js reads, in
+    blocks of `block` frames; `first` is the first block's length (0: a whole block), to
+    keep the blocks on a sound's own grid."""
+    s = np.frombuffer(pcm, dtype="<i2").astype(np.int64)
+    w = _Bits()
+    if channels == 1:
+        for a, b in _blocks(len(s), first, block):
+            x = s[a:b]
+            _cost, plan = _plan(x, 16)
+            _emit_channel(w, x, plan, 16)
+        return w.bytes()
+    L, R = s[0::2], s[1::2]
+    for a, b in _blocks(len(L), first, block):
+        l, r = L[a:b], R[a:b]
+        side = r - l
+        cl, pl = _plan(l, 16)
+        cr, pr = _plan(r, 16)
+        cs, ps = _plan(side, 17)
+        modes = [(cl + cr, 0, (l, pl, 16), (r, pr, 16)),
+                 (cl + cs, 1, (l, pl, 16), (side, ps, 17)),
+                 (cr + cs, 2, (r, pr, 16), (side, ps, 17))]
+        _c, mode, c0, c1 = min(modes, key=lambda m: m[0])
+        STEREO_MODES[mode] += 1
+        w.put(mode, 2)
+        _emit_channel(w, c0[0], c0[1], c0[2])
+        _emit_channel(w, c1[0], c1[1], c1[2])
+    return w.bytes()
+
+
+def _emit_channel(w, x, plan, width):
+    if plan[0] == "s":
+        SHIFTED[0] += 1
+        w.put(5, 3)
+        w.put(plan[1], 4)
+        _emit_channel(w, x >> plan[1], plan[2], width - plan[1])
+        return
+    if plan[0] == "v":
+        w.put(7, 3)
+        w.put_signed(x, width)
+        return
+    order, parts = plan
+    w.put(order, 3)
+    if order:
+        w.put_signed(x[:order], width)
+    for k, u in parts:
+        w.put(k, 5)
+        w.put_rice(u, k)
+
+
+def pcm_decode(code: bytes, channels: int, frames: int, first: int = 0, block: int = BLOCK) -> bytes:
+    """Reference decoder (slow, for checks); recipe.js is the one the page runs."""
+    bits = np.unpackbits(np.frombuffer(code, dtype=np.uint8))
+    pos = [0]
+
+    def get(k):
+        v = 0
+        for _ in range(k):
+            v = (v << 1) | int(bits[pos[0]]); pos[0] += 1
+        return v
+
+    def signed(k):
+        v = get(k)
+        return v - (1 << k) if v >= 1 << (k - 1) else v
+
+    def unary():
+        q = 0
+        while bits[pos[0]]:
+            q += 1; pos[0] += 1
+        pos[0] += 1
+        return q
+
+    def channel(n, width):
+        t = get(3)
+        if t == 5:
+            sh = get(4)
+            return [v << sh for v in channel(n, width - sh)]
+        if t == 7:
+            return [signed(width) for _ in range(n)]
+        x = [signed(width) for _ in range(t)]
+        for a, b in _parts(n - t):
+            k = get(5)
+            for _ in range(b - a):
+                u = (unary() << k) | get(k)
+                e = -((u + 1) >> 1) if u & 1 else u >> 1
+                if t == 0: v = e
+                elif t == 1: v = e + x[-1]
+                elif t == 2: v = e + 2 * x[-1] - x[-2]
+                elif t == 3: v = e + 3 * x[-1] - 3 * x[-2] + x[-3]
+                else: v = e + 4 * x[-1] - 6 * x[-2] + 4 * x[-3] - x[-4]
+                x.append(v)
+        return x
+
+    out = []
+    for a0, b0 in _blocks(frames, first if 0 < first < block else 0, block):
+        n = b0 - a0
+        if channels == 1:
+            out.extend(channel(n, 16)); continue
+        mode = get(2)
+        a = channel(n, 16)
+        b = channel(n, 16 if mode == 0 else 17)
+        for i in range(n):
+            if mode == 0: L, R = a[i], b[i]
+            elif mode == 1: L, R = a[i], a[i] + b[i]
+            else: R, L = a[i], a[i] - b[i]
+            out.extend((L, R))
+    return np.asarray(out, dtype="<i2").tobytes()
+
+
+# ---------------------------------------------------------------------------
+# WAV layout
+
+def wav_pcm(b: bytes):
+    """(data offset, whole-frame byte count, channels) of 16-bit PCM WAV bytes, or None"""
+    if b[:4] != b"RIFF" or b[8:12] != b"WAVE":
+        return None
+    i, fmt, data = 12, None, None
+    while i + 8 <= len(b):
+        cid, sz = b[i:i + 4], struct.unpack_from("<I", b, i + 4)[0]
+        if cid == b"fmt " and sz >= 16:
+            tag, ch, _rate, _br, _ba, bits = struct.unpack_from("<HHIIHH", b, i + 8)
+            fmt = (tag, ch, bits)
+        elif cid == b"data":
+            data = (i + 8, min(sz, len(b) - i - 8))
+            break
+        i += 8 + sz + (sz & 1)
+    if not fmt or not data or fmt[0] != 1 or fmt[2] != 16 or fmt[1] not in (1, 2):
+        return None
+    frame = 2 * fmt[1]
+    return data[0], data[1] // frame * frame, fmt[1]
+
+
+# ---------------------------------------------------------------------------
+# recipes
+
+class V0Archive:
+    """A version-0 archive's layout for recipes: per entry its payload extent in the
+    file, h2, plain (padded) bytes on demand and, for a 16-bit PCM WAV, where the
+    samples are. The bytes it rebuilds are exactly the archive file's."""
+    def __init__(self, path: str):
+        self.a = Archive(path)
+        if self.a.version != 0:
+            raise SystemExit("%s is version %d, not 0 (archive.py repack --version 0)" % (path, self.a.version))
+        self.size = len(self.a.buf)
+        self.ext = []
+        for e in self.a.entries:
+            off, ln = self.a.raw_extent(e)
+            self.ext.append((off, ln, e))
+        self.ext.sort(key=lambda t: t[0])
+        self._plain = {}
+
+    def plain(self, e):
+        p = self._plain.get(e.index)
+        if p is None:
+            # the padded payload decoded whole: its last dword's padding bytes are the
+            # archive's own -- zero from archive.py, whatever the game's packer left in
+            # its sfx.a (78 entries there), and the byte permutation can move them inside
+            # the entry's last dword
+            off, ln = self.a.raw_extent(e)
+            full = raw_decode(bytes(self.a.buf[off:off + ln]), e.h2, ln)
+            p = (full, wav_pcm(full[:e.size]))
+            if len(self._plain) > 64:
+                self._plain.clear()
+            self._plain[e.index] = p
+        return p
+
+
+def _key_at(h2: int, dword: int) -> int:
+    k = ((h2 ^ RAW_XOR_CONST) | 1) & MASK32
+    for _ in range(dword):
+        k ^= (k << 8) & MASK32
+        k ^= k >> 9
+        k ^= (k << 23) & MASK32
+    return k
+
+
+class _KeyCache:
+    """xorshift state per entry, stepped forward from where the last window left it"""
+    def __init__(self):
+        self.at = {}
+
+    def key(self, e, dword):
+        got = self.at.get(e.index)
+        if got is None or got[0] > dword:
+            got = (0, ((e.h2 ^ RAW_XOR_CONST) | 1) & MASK32)
+        d, k = got
+        while d < dword:
+            k ^= (k << 8) & MASK32
+            k ^= k >> 9
+            k ^= (k << 23) & MASK32
+            d += 1
+        self.at[e.index] = (d, k)
+        return k
+
+
+# ---------------------------------------------------------------------------
+# Vorbis (recipe version 2, part 3): a window's share of a sound as Vorbis packets.
+# Lossy by choice (round 96d). Each share is its own Vorbis stream, coded with up to
+# VORBIS_CONTEXT frames of the sound on either side, so two shares cut at a window edge
+# join where the sound did; the decoder drops the leading context and cuts the rest.
+# libvorbis writes the same three headers for one (channels, rate, quality), so a window
+# carries each distinct header set once (the recipe's head table), not per stream.
+
+VORBIS_CONTEXT = 2048
+# checks (vorbis-check): the samples each share was coded from, by its packets, and what
+# ffmpeg's own Vorbis decoder (the one Chromium's WebCodecs runs) makes of each stream
+VORBIS_ORACLE: dict | None = None
+VORBIS_CHECKS: list | None = None
+
+
+def _vorbis_note(ogg: bytes, packets: list[bytes], seg: bytes, channels: int, rate: int, lead: int, frames: int) -> None:
+    import hashlib, subprocess
+    x = np.frombuffer(seg, dtype="<i2").reshape(-1, channels).astype(np.float64) / 32768
+    if VORBIS_ORACLE is not None:
+        VORBIS_ORACLE[hashlib.sha1(b"".join(packets)).digest()] = [x[:, c] for c in range(channels)]
+    if VORBIS_CHECKS is not None:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", "-", "-f", "f32le", "-ac", str(channels), "-"],
+                           input=ogg, capture_output=True, check=True)
+        y = np.frombuffer(r.stdout, dtype="<f4").reshape(-1, channels).astype(np.float64)
+        n = min(len(y), lead + frames)
+        ref, got = x[lead:n], y[lead:n]
+        sig, err = float((ref ** 2).sum()), float(((got - ref) ** 2).sum())
+        VORBIS_CHECKS.append({"rate": rate, "channels": channels, "frames": frames, "decoded": len(y),
+                              "needed": lead + frames, "snr": 10 * np.log10(sig / err) if err > 0 and sig > 0 else 99.0,
+                              "silent": sig == 0})
+
+
+def _ogg_packets(data: bytes) -> list[bytes]:
+    pos, cur, packets = 0, b"", []
+    while pos < len(data):
+        if data[pos:pos + 4] != b"OggS":
+            raise ValueError("not an Ogg page at %d" % pos)
+        nseg = data[pos + 26]
+        lace = data[pos + 27:pos + 27 + nseg]
+        body = pos + 27 + nseg
+        for l in lace:
+            cur += data[body:body + l]; body += l
+            if l < 255:
+                packets.append(cur); cur = b""
+        pos = body
+    return packets
+
+
+def _xiph(heads: list[bytes]) -> bytes:
+    """the three Vorbis headers as WebCodecs' (and Matroska's) description: a count byte,
+    the first two lengths Xiph-laced, then the headers"""
+    def lace(n):
+        return b"\xff" * (n // 255) + bytes([n % 255])
+    return b"\x02" + lace(len(heads[0])) + lace(len(heads[1])) + b"".join(heads)
+
+
+def vorbis_encode(pcm: bytes, channels: int, rate: int, quality: float) -> tuple[bytes, list[bytes]]:
+    """16-bit interleaved PCM -> (header description, audio packets), by ffmpeg's libvorbis"""
+    import subprocess
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", "-",
+                        "-c:a", "libvorbis", "-q:a", str(quality), "-f", "ogg", "-"],
+                       input=pcm, capture_output=True, check=True)
+    packets = _ogg_packets(r.stdout)
+    vorbis_encode.last_ogg = r.stdout
+    return _xiph(packets[:3]), packets[3:]
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7f; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def wav_rate(b: bytes) -> int:
+    i = 12
+    while i + 8 <= len(b):
+        cid, sz = b[i:i + 4], struct.unpack_from("<I", b, i + 4)[0]
+        if cid == b"fmt " and sz >= 16:
+            return struct.unpack_from("<I", b, i + 12)[0]
+        i += 8 + sz + (sz & 1)
+    raise ValueError("no fmt chunk")
+
+
+class _Heads:
+    """a window's head table: (channels, rate) -> index, the description bytes once each"""
+    def __init__(self):
+        self.index, self.rows = {}, []
+
+    def add(self, channels: int, rate: int, desc: bytes) -> int:
+        k = (channels, rate)
+        if k in self.index:
+            got = self.rows[self.index[k]]
+            if got[2] != desc:
+                raise SystemExit("libvorbis wrote two header sets for %d ch / %d Hz" % k)
+            return self.index[k]
+        self.index[k] = len(self.rows)
+        self.rows.append((channels, rate, desc))
+        return self.index[k]
+
+    def bytes(self) -> bytes:
+        return bytes([len(self.rows)]) + b"".join(struct.pack("<BII", c, r, len(d)) + d for c, r, d in self.rows)
+
+
+def window_recipe(arch: V0Archive, file_bytes, lo: int, hi: int, keys: _KeyCache, tail: int = 0,
+                  block: int = PCM_BLOCK, vorbis: float | None = None) -> bytes:
+    """The recipe for archive bytes [lo, hi) of one file (a window's share of it), then
+    `tail` zero bytes (the padding that window-aligns the next file in the stream).
+    `vorbis` (a libvorbis quality): the window's sound goes as Vorbis (recipe version 2)."""
+    segs = []
+    pos = lo
+    heads = _Heads() if vorbis is not None else None
+
+    def raw(a, b):
+        if b > a:
+            segs.append(b"\0" + struct.pack("<I", b - a) + bytes(file_bytes[a:b]))
+
+    for off, ln, e in arch.ext:
+        if off + ln <= pos:
+            continue
+        if off >= hi:
+            break
+        raw(pos, min(off, hi))
+        a, b = max(off, lo), min(off + ln, hi)
+        ra, rb = a - off, b - off                       # entry-relative
+        d0, d1 = ra // 4 * 4, (rb + 3) // 4 * 4
+        plain, pcm = arch.plain(e)
+        parts = []
+
+        def lit(x, y):
+            if y > x:
+                parts.append(b"\0" + struct.pack("<I", y - x) + plain[x:y])
+
+        if pcm:
+            p0, nbytes, ch = pcm
+            p1 = p0 + nbytes
+            frame = 2 * ch
+            lit(d0, min(d1, p0))
+            s, t = max(d0, p0), min(d1, p1)
+            if t > s:
+                f0, f1 = (s - p0) // frame, (t - p0 + frame - 1) // frame
+                if heads is not None:
+                    total = nbytes // frame
+                    lead, trail = min(f0, VORBIS_CONTEXT), min(total - f1, VORBIS_CONTEXT)
+                    # a share always has VORBIS_CONTEXT frames after it, silence past the sound's
+                    # end: ffmpeg trims a stream to its last granule, half a short block before
+                    # the end of what was coded (128 frames at 44.1 kHz); the context covers that
+                    seg = plain[p0 + (f0 - lead) * frame:p0 + (f1 + trail) * frame] + bytes((VORBIS_CONTEXT - trail) * frame)
+                    desc, packets = vorbis_encode(seg, ch, wav_rate(plain[:p0]), vorbis)
+                    if VORBIS_ORACLE is not None or VORBIS_CHECKS is not None:
+                        _vorbis_note(vorbis_encode.last_ogg, packets, seg, ch, wav_rate(plain[:p0]), lead, f1 - f0)
+                    code = b"".join(_varint(len(x)) + x for x in packets)
+                    parts.append(b"\3" + struct.pack("<BIIIIBII", ch, f1 - f0, (s - p0) - f0 * frame, t - s, lead,
+                                                     heads.add(ch, wav_rate(plain[:p0]), desc), len(packets), len(code)) + code)
+                    lit(max(d0, p1), d1)
+                    segs.append(b"\1" + struct.pack("<IIBH", b - a, keys.key(e, d0 // 4), ra - d0, len(parts)) + b"".join(parts))
+                    pos = b
+                    continue
+                first = (-f0) % block                   # back onto the sound's own block grid
+                code = pcm_encode(plain[p0 + f0 * frame:p0 + f1 * frame], ch, first, block)
+                head = struct.pack("<BIIII", ch, f1 - f0, (s - p0) - f0 * frame, t - s, len(code))
+                if first or block != BLOCK:
+                    parts.append(b"\2" + head + struct.pack("<HH", first, block) + code)
+                else:
+                    parts.append(b"\1" + head + code)
+            lit(max(d0, p1), d1)
+        else:
+            lit(d0, d1)
+        segs.append(b"\1" + struct.pack("<IIBH", b - a, keys.key(e, d0 // 4), ra - d0, len(parts)) + b"".join(parts))
+        pos = b
+    raw(pos, hi)
+    if tail:
+        segs.append(b"\0" + struct.pack("<I", tail) + bytes(tail))
+    if heads is not None and heads.rows:
+        return b"RW\2" + struct.pack("<IH", hi - lo + tail, len(segs)) + heads.bytes() + b"".join(segs)
+    return b"RW\1" + struct.pack("<IH", hi - lo + tail, len(segs)) + b"".join(segs)
+
+
+def decode_recipe(r: bytes, vorbis=None) -> bytes:
+    """Reference recipe decoder (Python), the same format recipe.js reads. A version 2
+    recipe needs `vorbis(head, packets) -> float planes` (head: channels, rate, description)
+    for its Vorbis parts: VORBIS_ORACLE.planes gives the samples they were coded from,
+    so the rebuilt window is then the source archive's own bytes."""
+    assert r[:2] == b"RW" and r[2] in (1, 2), r[:3]
+    version = r[2]
+    out_len, nseg = struct.unpack_from("<IH", r, 3)
+    p, out = 9, bytearray()
+    heads = []
+    if version == 2:
+        n = r[p]; p += 1
+        for _ in range(n):
+            ch, rate, ln = struct.unpack_from("<BII", r, p); p += 9
+            heads.append((ch, rate, r[p:p + ln])); p += ln
+    for _ in range(nseg):
+        kind = r[p]; p += 1
+        if kind == 0:
+            (n,) = struct.unpack_from("<I", r, p); p += 4
+            out += r[p:p + n]; p += n
+            continue
+        seg_len, key, skip, nparts = struct.unpack_from("<IIBH", r, p); p += 11
+        plain = bytearray()
+        for _ in range(nparts):
+            pk = r[p]; p += 1
+            if pk == 0:
+                (n,) = struct.unpack_from("<I", r, p); p += 4
+                plain += r[p:p + n]; p += n
+            elif pk == 3:
+                assert version == 2, "a Vorbis part in a version 1 recipe"
+                ch, fr, sk, tk, lead, hidx, npk, cl = struct.unpack_from("<BIIIIBII", r, p); p += 26
+                end, packets = p + cl, []
+                for _ in range(npk):
+                    ln, sh = 0, 0
+                    while True:
+                        b = r[p]; p += 1
+                        ln |= (b & 0x7f) << sh; sh += 7
+                        if not b & 0x80:
+                            break
+                    packets.append(r[p:p + ln]); p += ln
+                assert p == end and heads[hidx][0] == ch
+                planes = vorbis(heads[hidx], packets)
+                assert len(planes[0]) >= lead + fr, (len(planes[0]), lead, fr)
+                x = np.stack([np.asarray(pl[lead:lead + fr], dtype=np.float64) for pl in planes[:ch]], axis=1)
+                pcm = np.clip(np.round(x * 32768), -32768, 32767).astype("<i2").tobytes()
+                plain += pcm[sk:sk + tk]
+            else:
+                ch, fr, sk, tk, cl = struct.unpack_from("<BIIII", r, p); p += 17
+                first, block = 0, BLOCK
+                if pk == 2:
+                    first, block = struct.unpack_from("<HH", r, p); p += 4
+                pcm = pcm_decode(r[p:p + cl], ch, fr, first, block); p += cl
+                plain += pcm[sk:sk + tk]
+        ndw = len(plain) // 4
+        keys = []
+        k = key
+        for _ in range(ndw):
+            keys.append(k)
+            k ^= (k << 8) & MASK32; k ^= k >> 9; k ^= (k << 23) & MASK32
+        from archive import _permute, _xor_keystream
+        _permute(plain, keys)
+        enc = _xor_keystream(bytes(plain), keys)
+        out += enc[skip:skip + seg_len]
+    assert len(out) == out_len, (len(out), out_len)
+    return bytes(out)
+
+
+def cmd_size(args) -> int:
+    arch = V0Archive(args.archive)
+    data = arch.a.buf
+    keys = _KeyCache()
+    stored = 0
+    n = (arch.size + WINDOW - 1) // WINDOW
+    for w in range(n):
+        lo, hi = w * WINDOW, min(arch.size, (w + 1) * WINDOW)
+        stored += len(gzip.compress(window_recipe(arch, data, lo, hi, keys), 6, mtime=0))
+        if w % 50 == 0:
+            print("  window %d/%d: %.1f MB stored so far" % (w, n, stored / 1e6), flush=True)
+    print("%s: %d windows, %.1f MB archive -> %.1f MB of gzipped recipes" % (args.archive, n, arch.size / 1e6, stored / 1e6))
+    return 0
+
+
+def cmd_check(args) -> int:
+    arch = V0Archive(args.archive)
+    data = arch.a.buf
+    keys = _KeyCache()
+    n = (arch.size + WINDOW - 1) // WINDOW
+    step = max(1, n // args.windows)
+    for w in range(0, n, step):
+        lo, hi = w * WINDOW, min(arch.size, (w + 1) * WINDOW)
+        r = window_recipe(arch, data, lo, hi, keys)
+        assert decode_recipe(r) == bytes(data[lo:hi]), "window %d differs" % w
+        print("  window %d: %d recipe bytes -> %d archive bytes, identical" % (w, len(r), hi - lo), flush=True)
+    return 0
+
+
+def cmd_vorbis_check(args) -> int:
+    """Vorbis recipes for windows of a version-0 archive, checked two ways: rebuilt with the
+    samples each share was coded from they must be the archive's own bytes (structure:
+    offsets, context, cuts, the entries' permute and XOR), and ffmpeg's decode of every
+    stream must cover its share and say how close it came (SNR, per share)."""
+    import hashlib
+    global VORBIS_ORACLE, VORBIS_CHECKS
+    VORBIS_ORACLE, VORBIS_CHECKS = {}, []
+    arch = V0Archive(args.archive)
+    data = arch.a.buf
+    keys = _KeyCache()
+    n = (arch.size + WINDOW - 1) // WINDOW
+    step = max(1, n // args.windows) if args.windows else 1
+    oracle = lambda head, packets: VORBIS_ORACLE[hashlib.sha1(b"".join(packets)).digest()]
+    stored = plain = 0
+    for w in range(0, n, step):
+        lo, hi = w * WINDOW, min(arch.size, (w + 1) * WINDOW)
+        r = window_recipe(arch, data, lo, hi, keys, vorbis=args.quality)
+        assert decode_recipe(r, oracle) == bytes(data[lo:hi]), "window %d differs" % w
+        stored += len(gzip.compress(r, 9, mtime=0)); plain += hi - lo
+        VORBIS_ORACLE.clear()
+    c = VORBIS_CHECKS
+    short = [x for x in c if x["decoded"] < x["needed"]]
+    snr = np.array([x["snr"] for x in c if not x["silent"]])
+    print("%s: %d windows rebuilt exactly; %d Vorbis shares, %d decoded short; %.1f MB -> %.1f MB stored"
+          % (args.archive, len(range(0, n, step)), len(c), len(short), plain / 1e6, stored / 1e6))
+    if len(snr):
+        print("  SNR per share (dB): min %.1f, p10 %.1f, median %.1f, p90 %.1f"
+              % (snr.min(), np.percentile(snr, 10), np.median(snr), np.percentile(snr, 90)))
+    return 1 if short else 0
+
+
+def _wav(pcm: bytes, rate: int, ch: int, bits: int = 16, extra: bytes = b"", odd: bytes = b"") -> bytes:
+    fmt = struct.pack("<HHIIHH", 1, ch, rate, rate * ch * bits // 8, ch * bits // 8, bits)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + extra + b"data" + struct.pack("<I", len(pcm) + len(odd)) + pcm + odd
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def cmd_fixture(args) -> int:
+    """A synthetic version-0 archive (no game data) and recipes for awkward pieces of it,
+    for tests/recomp-recipe.test.js: the page's decoder must rebuild every piece exactly."""
+    from archive import write_archive
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(1234)
+
+    def walk(n, step=900):
+        return np.clip(np.cumsum(rng.integers(-step, step + 1, n)), -32768, 32767).astype("<i2")
+
+    mono = walk(10000)
+    left, right = walk(7000), walk(7000)
+    right[100:400] = 32767; left[100:400] = -32768          # side = +65535, the 17-bit edge
+    right[500:700] = -32768; left[500:700] = 32767          # side = -65535
+    stereo = np.empty(14000, dtype="<i2"); stereo[0::2], stereo[1::2] = left, right
+    noise = rng.integers(-32768, 32768, 9000).astype("<i2")  # verbatim beats prediction here
+
+    def pair(smooth_first):
+        """a smooth channel and its copy plus a little noise: side coding wins, and the
+        smooth channel decides whether left/side or right/side does"""
+        smooth = (np.sin(np.arange(9000) / 40.0) * 12000).astype(np.int64)
+        other = np.clip(smooth + rng.integers(-3, 4, 9000), -32768, 32767)
+        L, R = (smooth, other) if smooth_first else (other, smooth)
+        s = np.empty(18000, dtype="<i2"); s[0::2], s[1::2] = L, R
+        return s.tobytes()
+
+    items = [
+        ("sfx/lside.wav", _wav(pair(True), 44100, 2)),
+        ("sfx/rside.wav", _wav(pair(False), 44100, 2)),
+        ("sfx/mono.wav", _wav(mono.tobytes(), 22050, 1)),
+        ("sfx/stereo.wav", _wav(stereo.tobytes(), 44100, 2, extra=b"LIST" + struct.pack("<I", 6) + b"abcdef")),
+        ("sfx/odd.wav", _wav(walk(5001).tobytes(), 24000, 1, odd=b"\x7f")),
+        ("sfx/noise.wav", _wav(noise.tobytes(), 48000, 1)),
+        # near-lossless sound: low bits zeroed (lossy.py), 4 of them mono, 3 stereo
+        ("sfx/trim4.wav", _wav((walk(9000) // 16 * 16).astype("<i2").tobytes(), 44100, 1)),
+        ("sfx/trim3.wav", _wav((walk(12000) // 8 * 8).astype("<i2").tobytes(), 44100, 2)),
+        ("sfx/eight.wav", _wav(bytes(range(256)) * 20, 11025, 1, bits=8)),
+        ("gfx/a.anm2", (b"<AnimatedActor>" + b"<Frame XPosition=\"1\"/>" * 400 + b"</AnimatedActor>")),
+        ("gfx/b.bin", rng.integers(0, 256, 30001).astype(np.uint8).tobytes()),
+        ("gfx/empty.txt", b""),
+    ]
+    from archive import key_of, resource_key
+    recs = []
+    for name, data in items:
+        h1, h2 = key_of(resource_key(name))
+        recs.append({"h1": h1, "h2": h2, "data": data})
+    path = out / "fixture.a"
+    write_archive(str(path), 0, recs)
+    # The game's own packer leaves bytes other than zero in a payload's padding (its
+    # sfx.a), and the decoder never looks at them: give every padded entry here some.
+    from archive import _permute, _xor_keystream
+    junked = 0
+    buf = bytearray(path.read_bytes())
+    with Archive(str(path)) as tmp:
+        for e in tmp.entries:
+            off, ln = tmp.raw_extent(e)
+            if ln == e.size:
+                continue
+            plain = bytearray(tmp.decode(e) + bytes(rng.integers(1, 256, ln - e.size).astype(np.uint8)))
+            keys = raw_keys(e.h2, ln // 4)
+            _permute(plain, keys)
+            buf[off:off + ln] = _xor_keystream(bytes(plain), keys)
+            junked += 1
+    path.write_bytes(bytes(buf))
+    assert junked >= 3, junked
+    arch = V0Archive(str(path))
+    by_h2 = {r["h2"]: r["data"] for r in recs}
+    assert all(arch.a.decode(e) == by_h2[e.h2] for e in arch.a.entries), "junk padding is never decoded"
+    data = bytes(arch.a.buf)
+    keys = _KeyCache()
+    pieces = []
+    lo = 0
+    while lo < len(data):
+        hi = min(len(data), lo + args.piece)
+        tail = 5 if hi == len(data) else 0
+        r = window_recipe(arch, data, lo, hi, keys, tail, BLOCK if len(pieces) % 2 else PCM_BLOCK)
+        name = "p%d.recipe" % len(pieces)
+        (out / name).write_bytes(r)
+        assert decode_recipe(r) == data[lo:hi] + bytes(tail), "piece %d" % len(pieces)
+        pieces.append({"file": name, "lo": lo, "hi": hi, "tail": tail})
+        lo = hi
+    import json
+    (out / "pieces.json").write_text(json.dumps({"archive": "fixture.a", "pieces": pieces,
+                                                 "stereoModes": STEREO_MODES, "shifted": SHIFTED[0]}, indent=1))
+    print("fixture: %d bytes, %d entries, %d pieces" % (len(data), len(items), len(pieces)))
+    return 0
+
+
+def cmd_vorbis_fixture(args) -> int:
+    """cmd_fixture's synthetic archive cut again with its 16-bit sound as Vorbis (version 2
+    recipes v*.recipe), and vorbis.json: per Vorbis stream (sha1 of its packets) the samples
+    it was coded from as float32 planes, for tests/recomp-recipe.test.js to decode with in
+    place of the browser's AudioDecoder (node has none)."""
+    import base64, hashlib, json
+    global VORBIS_ORACLE
+    rc = cmd_fixture(args)
+    if rc:
+        return rc
+    out = Path(args.out)
+    meta = json.loads((out / "pieces.json").read_text())
+    arch = V0Archive(str(out / meta["archive"]))
+    data = bytes(arch.a.buf)
+    keys = _KeyCache()
+    VORBIS_ORACLE = {}
+    planes = {}
+    vpieces = []
+    for i, pc in enumerate(meta["pieces"]):
+        r = window_recipe(arch, data, pc["lo"], pc["hi"], keys, pc["tail"], vorbis=4.0)
+        oracle = lambda head, packets: VORBIS_ORACLE[hashlib.sha1(b"".join(packets)).digest()]
+        assert decode_recipe(r, oracle) == data[pc["lo"]:pc["hi"]] + bytes(pc["tail"]), "vorbis piece %d" % i
+        name = "v%d.recipe" % i
+        (out / name).write_bytes(r)
+        vpieces.append(dict(pc, file=name, version=r[2]))
+        for k, v in VORBIS_ORACLE.items():
+            planes[k.hex()] = [base64.b64encode(np.asarray(x, dtype="<f4").tobytes()).decode() for x in v]
+        VORBIS_ORACLE.clear()
+    (out / "vorbis.json").write_text(json.dumps({"pieces": vpieces, "planes": planes}))
+    print("vorbis fixture: %d pieces, %d of them version 2, %d Vorbis streams"
+          % (len(vpieces), sum(p["version"] == 2 for p in vpieces), len(planes)))
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("fixture"); p.add_argument("out"); p.add_argument("--piece", type=int, default=4093)
+    p.set_defaults(fn=cmd_fixture)
+    p = sub.add_parser("check"); p.add_argument("archive"); p.add_argument("--windows", type=int, default=4)
+    p.set_defaults(fn=cmd_check)
+    p = sub.add_parser("size"); p.add_argument("archive"); p.set_defaults(fn=cmd_size)
+    p = sub.add_parser("vorbis-fixture"); p.add_argument("out"); p.add_argument("--piece", type=int, default=4093)
+    p.set_defaults(fn=cmd_vorbis_fixture)
+    p = sub.add_parser("vorbis-check"); p.add_argument("archive"); p.add_argument("--windows", type=int, default=0)
+    p.add_argument("--quality", type=float, default=4.0); p.set_defaults(fn=cmd_vorbis_check)
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

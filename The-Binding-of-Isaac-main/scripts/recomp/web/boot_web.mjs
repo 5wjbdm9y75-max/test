@@ -1,0 +1,1405 @@
+// boot_web.mjs -- page-side driver for the WEB build of the lifted module.
+// Mirrors boot_integration.mjs stage for stage: place the memory image, check
+// the layout, arm the guard, seed the packed archives, register the instance
+// tree lazily, run the host boot, run main. Files arrive from the runner's
+// local HTTP server (run_web.mjs, 127.0.0.1 only).
+//
+// Everything the runner reads back lives on window: isaacLog (every line the
+// module printed), isaacFrames (the last frames the host's SwapBuffers shim
+// read back from the WebGL framebuffer), isaacDone ({mainRc, bootRc, ...}).
+import Module from './boot.mjs';
+import { openModDb, seedMods, putModState, setModEnabled, underMods, isImportMark, disableTarget,
+         listMods, isPacked, createPackStore, createPackedMods, packedIndex, createPackDownloader } from './mods.mjs';
+import { createPads, createPadGate, rumble } from './gamepad.mjs';
+
+const logEl = document.getElementById('log');
+// Round 34: the shipping page (play.mjs) sets window.isaacPageHooks before importing this module:
+// url(u) rewrites every synchronous fetch (root path, cache-busting ?v=), fetchBytes(u) fetches the
+// boot stages asynchronously with a progress bar, instantiateWasm streams the module, onLog sees
+// every line, beforeMain(m) is awaited before main (the Play click). All optional; boot_web.html sets none.
+// onAudioReady(A) holds the output gain at zero until the page reveals the game.
+// With no readiness hook, the raw boot harness keeps its ordinary audible output.
+const hooks = (typeof window !== 'undefined' && window.isaacPageHooks) || {};
+window.isaacLog = [];
+window.isaacFrames = [];
+window.isaacDone = null;
+window.isaacFrame = 0;     // the host's frame counter, live (round 25: a driver paces key events on it)
+const KEEP_FRAMES = 6;
+function log(line) {
+  window.isaacLog.push(String(line));
+  if (hooks.onLog) hooks.onLog(String(line));
+  if (window.isaacLog.length % 50 === 0 || /RESULT|TRAP|frame\]/.test(line)) {
+    logEl.textContent = window.isaacLog.slice(-12).join('\n');
+  }
+}
+
+// Round 101: the cause of a stop, into the log a player can copy. The host's
+// isaac_log (host_trap.c) prints through console.warn so a line is not held
+// back until a newline, which means its lines were never in isaacLog: the
+// error panel and "Copy log" showed the game's last lines and the closing
+// report, and not the one line that said why -- `[isaac][TRAP] ...`,
+// `[isaac] reason: ...`, a throw nothing caught, an allocation that failed.
+// Two bug reports arrived that way with nothing to go on. Only the lines that
+// name a stop are taken (the routine ones would bury the game's own log), and
+// the out-of-memory line only its first few times.
+const STOP_LINE = /\[isaac\]\[TRAP\]|\[isaac\] =+ STOPPING|\[isaac\] reason:|\[isaac\]\[c\+\+\] (?:throw of \S+ from \S+: no catch|_CxxThrowException|the catch at|__RTDynamicCast)|\[isaac\]\[crt\] (?:_?exit\(|abort\(|std::terminate|ASSERTION|_invalid_parameter)|\[isaac\]\[k32\] (?:UnhandledExceptionFilter|TerminateProcess|WaitForSingleObject| +code 0x| +EXCEPTION_POINTERS)|\[isaac\]\[heap\] (?:OUT OF MEMORY|double free)|\[isaac\]\[lua\] .*(?:exhausted|deeper)/;
+let oomLines = 0;
+if (typeof console !== 'undefined' && !console.__isaacWarn) {
+  const warn0 = console.warn.bind(console);
+  console.warn = (...args) => {
+    warn0(...args);
+    try {
+      const s = typeof args[0] === 'string' ? args[0] : '';
+      if (!s || !STOP_LINE.test(s)) return;
+      if (/OUT OF MEMORY/.test(s) && ++oomLines > 4) return;
+      for (const l of s.split('\n')) log(l);
+    } catch (e) { /* the log never stops the game */ }
+  };
+  console.__isaacWarn = true;
+}
+
+// Synchronous binary fetch: the RAM-FS asks for lazy bytes from inside a
+// blocking call into wasm, so the answer cannot be awaited. A synchronous
+// XHR in the window context may only read text, and Chromium strips a
+// leading UTF-8 BOM from text responses whatever the charset label (the
+// x-user-defined trick lost three bytes of every BOM-prefixed .anm2/.fs),
+// so the runner serves ?b64=1 as base64 and the bytes are decoded here.
+// Round 55 tried 8-bit text instead (charset x-user-defined behind one pad
+// byte, charCodeAt & 0xff): 442 windows to frame 300 took 70-75 s at a 4x
+// throttle against 50 s with base64 -- the x-user-defined string is two-byte
+// and the decode loop loses more than atob costs. Base64 stays.
+// Round 55: the browser's own base64 decoder where it has one (Chrome 140+,
+// Firefox 133+, Safari 18.2+): one 1 MiB archive window decodes in 3 ms at a
+// 4x CPU throttle against 17 ms for atob and a charCodeAt loop, and leaves no
+// 1 MB binary string behind for the collector. The loop stays for the rest.
+const decodeBase64 = (typeof Uint8Array.fromBase64 === 'function')
+  ? (txt) => Uint8Array.fromBase64(txt)
+  : (txt) => { const bin = atob(txt), out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; };
+function fetchSync(url) {
+  if (hooks.url) url = hooks.url(url);
+  const sep = url.includes('?') ? '&' : '?';
+  const x = new XMLHttpRequest();
+  x.open('GET', url + sep + 'b64=1', false);
+  x.send(null);
+  if (x.status !== 200) throw new Error(`${url}: HTTP ${x.status}`);
+  return decodeBase64(x.responseText);
+}
+// The boot stages (memory image, index, the eagerly seeded archives, the Lua) go through
+// fetchBytes: the synchronous fetch by default, an asynchronous one with byte-level progress
+// under the shipping page (round 34). The reads the RAM-FS makes during main stay synchronous.
+const fetchBytes = hooks.fetchBytes || (async (url) => fetchSync(url));
+
+const params = new URLSearchParams(location.search);
+// Round 76: defaults the page wants applied, without them appearing in the URL.
+// A query the player never typed does not belong in a link they might copy, and
+// a real query still wins over a default.
+for (const [k, v] of Object.entries((hooks && hooks.params) || {})) {
+  if (!params.has(k)) params.set(k, String(v));
+}
+const cfg = {
+  canvas: document.getElementById('canvas'),
+  print: log,
+  printErr: log,
+  instantiateWasm: hooks.instantiateWasm,     // round 34: the shipping page streams the module with a progress bar
+  preRun: [() => {
+    // a live page (ISAAC_YIELD=1) with no budget plays until it is closed
+    cfg.ENV.ISAAC_MAX_FRAMES = params.get('frames') || (params.get('ISAAC_YIELD') === '1' ? '100000000' : '5');
+    cfg.ENV.ISAAC_LOG_TIME = '1';
+    for (const [k, v] of params) if (k.startsWith('ISAAC_')) cfg.ENV[k] = v;
+  }],
+};
+// ---- controllers -----------------------------------------------------------------------
+// The game polls XInput for four slots (host_shims_xinput.c); the page answers
+// from the browser's Gamepad API (gamepad.mjs) and plays the game's rumble on the
+// pad. A browser shows a pad to the page once one of its buttons is pressed.
+const pads = createPads(() => (typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : []), { memoMs: 2, idleMs: 500 });
+// a page menu that has the pad (play.mjs: EDIT FILE, the mods menus) shows the game a resting one
+const padGates = [createPadGate(), createPadGate(), createPadGate(), createPadGate()];
+cfg.isaacPadState = (slot) => {
+  const captured = typeof window.isaacPadCaptured === 'function' && !!window.isaacPadCaptured();
+  return padGates[slot & 3](pads.state(slot), captured);
+};
+window.isaacPadReader = pads;
+cfg.isaacPadRumble = (slot, left, right) => { rumble(pads.pad(slot), left, right); };
+window.isaacPads = () => ({ count: pads.count(), slots: [0, 1, 2, 3].map((i) => pads.state(i)) });
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('gamepadconnected', (e) => { pads.wake(); log(`[pad] ${e.gamepad.id} connected (browser pad ${e.gamepad.index})`); });
+  window.addEventListener('gamepaddisconnected', (e) => { pads.wake(); log(`[pad] ${e.gamepad.id} disconnected`); });
+}
+let lazyReads = 0, lazyBytes = 0;
+// round 107: the packed mods of this boot (mods.mjs createPackedMods), set up by 'register packed mods'
+let packedMods = null, packStore = null;
+// round 108: the background download of every pack of them (play.mjs's, or one of its own here)
+let packDownloader = null;
+const background = () => packDownloader || hooks.packDownloader || null;
+const lazyByFile = new Map();                              // src -> bytes (round 40: what the run start reads)
+const preadTrail = [];                                    // the first window offsets, in order (scan or thrash?)
+const preadStacks = [];                                   // three wasm stacks under a window fetch: who reads the archive?
+window.isaacLazyStats = () => ({ packed: packedMods ? Object.assign({ store: packStore.stats }, packedMods.stats, packedMods.held()) : null,
+  background: background() ? background().stats() : null, reads: lazyReads, bytes: lazyBytes, windows: preads, windowBytes: preadBytes, distinctWindows: windowsSeen.size, trail: preadTrail.slice(0, 60), stacks: preadStacks,
+  prefetched, prefetchHits, prefetchMisses, aheadFetched, readerWaits, readerWaitMs: Math.round(readerWaitMs), reader: !!reader, trailKept, trailShipped, trailLen: trail.length, trailWritten,
+  top: [...lazyByFile].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k.replace(/^.*\//, '')} ${(v / 1048576).toFixed(1)} MB`) });
+cfg.isaacLazyRead = (src, dst, len) => {
+  // round 107: a packed mod's file is read in place (isaacLazyPread); an engine
+  // that asks for one whole can only have it if it is at hand
+  if (packedMods && packedMods.owns(src)) {
+    const b = packedMods.readNow(src);
+    if (b && b.length >= len) { m.HEAPU8.set(b.subarray(0, len), dst); lazyReads += 1; lazyBytes += len; return 1; }
+    log(`  lazy read FAILED for ${src}: a packed mod's file asked for whole (this engine has no ranged reads)`);
+    return 0;
+  }
+  try {
+    const bytes = fetchSync(`/instance/${src}`);
+    if (bytes.length < len) { log(`  lazy read of ${src}: ${bytes.length} bytes served, ${len} registered`); return 0; }
+    m.HEAPU8.set(bytes.subarray(0, len), dst);
+    lazyReads += 1; lazyBytes += len; lazyByFile.set(src, (lazyByFile.get(src) || 0) + len);
+    dropBody(bytes);
+    return 1;
+  } catch (e) {
+    log(`  lazy read FAILED for ${src}: ${e.message}`);
+    return 0;
+  }
+};
+// Round 24e: positional reads. A lazy file of ISAAC_FS_WINDOW_MIN MiB or
+// more (default 32) is never fetched whole: the RAM-FS keeps two 1 MB
+// windows per file and refills them through this call, which the runner
+// serves as a byte slice (?off=&len=, base64 like every sync fetch here).
+// That is what lets the DLC archives (afterbirth.a 145 MB, afterbirthp.a
+// 604 MB, repentance.a 385 MB) mount inside a wasm32 heap.
+// Round 31: saves persist. The FS shim hands every file the game wrote to
+// Module.isaacPersist when it is closed (the persistentgamedata*.dat under
+// Documents/My Games/... on each game over) and announces deletes through
+// Module.isaacUnlink; they go into an IndexedDB store keyed by the FS key
+// and are seeded back before main at the next boot. `persist=0` on the URL
+// turns the store off (a fresh profile every load).
+const persistOn = params.get('persist') !== '0';
+// Round 74: mods keep their own database. A file the game writes under mods/ is
+// mod state, not a save, and routing it here is what lets the mods menu reset or
+// remove anything it likes without a save file being in reach. `mods=0` leaves
+// the whole feature out (the drivers that measure a bare boot).
+const modsOn = params.get('mods') !== '0';
+let modDb = null;
+const SAVE_DB = 'isaac-saves', SAVE_STORE = 'files';
+// Round 86c: a database can exist at this version without the store in it --
+// `indexedDB.open(name)` with no version makes an empty one, and an interrupted
+// upgrade can leave one behind. After that `open(name, 1)` never fires
+// onupgradeneeded, the store is never made, and every save quietly goes
+// nowhere. Check, and reopen one version up to create it.
+function openSaveDb() {
+  // versionless first: whatever is there, at whatever version it is at
+  const open = (version) => new Promise((resolve, reject) => {
+    const req = version ? indexedDB.open(SAVE_DB, version) : indexedDB.open(SAVE_DB);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SAVE_STORE)) db.createObjectStore(SAVE_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') { resolve(null); return; }
+    open(0).then((db) => {
+      if (db.objectStoreNames.contains(SAVE_STORE)) { resolve(db); return; }
+      const next = db.version + 1;
+      db.close();
+      open(next).then(resolve, reject);
+    }, reject);
+  });
+}
+let saveDb = null, persisted = 0, unlinked = 0;
+const persistPending = [];
+cfg.isaacPersist = (key, src, ptr, len) => {
+  if (modKeyTaken(key, () => m.HEAPU8.slice(ptr, ptr + len))) return 1;
+  if (!persistOn) return 0;
+  const bytes = m.HEAPU8.slice(ptr, ptr + len);      // a copy: the guest buffer is freed after the call
+  persistPending.push({ key, src, bytes });
+  persisted += 1;
+  flushSaves();
+  return 1;
+};
+cfg.isaacUnlink = (key, src) => {
+  if (modKeyTaken(key, null)) return 1;
+  if (!persistOn) return 0;
+  persistPending.push({ key, src, bytes: null });
+  unlinked += 1;
+  flushSaves();
+  return 1;
+};
+// Anything the game writes under mods/ belongs to the mods store. The one file
+// that is not stored at all is the sentinel's: the mods menu writes a disable.it
+// into mods/importmod/ when Enter selects that row, and that write IS the button.
+function modKeyTaken(key, take) {
+  if (!modsOn || !underMods(key)) return false;
+  if (isImportMark(key)) {
+    log('  IMPORT MOD chosen in the game');
+    try { if (hooks.onModImport) hooks.onModImport(); } catch (e) { log(`  the import menu failed to open: ${e.message}`); }
+    return true;
+  }
+  // A disable.it is the engine saying "turn this mod off". It will not read the
+  // file back at the next start, so the meaning is kept and the file is not: a
+  // mod that is off is left unseeded, which the engine cannot argue with.
+  const off = disableTarget(key);
+  if (off) {
+    log(`  ${off} turned ${take ? 'off' : 'on'} in the game's list`);
+    if (modDb) setModEnabled(modDb, off, !take).catch((e) => log(`  mod flag FAILED: ${e.message}`));
+    return true;
+  }
+  const bytes = take ? take() : null;
+  if (modDb) putModState(modDb, key, bytes).catch((e) => log(`  mod state write FAILED: ${e.message}`));
+  return true;
+}
+function flushSaves() {
+  if (!saveDb || !persistPending.length) return;
+  const tx = saveDb.transaction(SAVE_STORE, 'readwrite'), st = tx.objectStore(SAVE_STORE);
+  for (const p of persistPending.splice(0)) {
+    if (p.bytes) st.put({ src: p.src, bytes: p.bytes }, p.key); else st.delete(p.key);
+  }
+  tx.onerror = () => log(`  save store write FAILED: ${tx.error}`);
+}
+function readSaves() {
+  return new Promise((resolve) => {
+    if (!saveDb) { resolve([]); return; }
+    const out = [];
+    const req = saveDb.transaction(SAVE_STORE, 'readonly').objectStore(SAVE_STORE).openCursor();
+    req.onsuccess = () => {
+      const c = req.result;
+      if (!c) { resolve(out); return; }
+      out.push({ key: c.key, src: c.value.src, bytes: c.value.bytes });
+      c.continue();
+    };
+    req.onerror = () => resolve(out);
+  });
+}
+window.isaacSaveStats = () => ({ persisted, unlinked, pending: persistPending.length });
+let preads = 0, preadBytes = 0;
+// Round 41: a fetched body is copied into the wasm heap and then DETACHED
+// (ArrayBuffer.prototype.transfer(0) frees the backing store at once). A run
+// start reads some 460 MB of archive windows in a few seconds; left to the
+// GC, those 1 MB bodies piled up to a 2.8 GB renderer peak before it caught
+// up -- on a 4 GB machine, the difference between playing and a dead tab.
+const dropBody = (bytes) => { try { const b = bytes.buffer; if (b && typeof b.transfer === 'function' && !b.detached) b.transfer(0); } catch (e) { /* older browser: the GC frees it */ } };
+const windowsSeen = new Set();
+// ---- round 55: the boot trail; round 56: the reader Worker -----------------------
+// Round 55: the page keeps the trail of the windows the boot read up to its
+// 300th frame (localStorage, this origin) and the next visit fetches them
+// ahead. Round 56: a Worker reads every window (below).
+const TRAIL_KEY = 'isaac-boot-trail', TRAIL_MAX = 512, READER_PARALLEL = 6, READER_BUDGET = 128 << 20, READ_AHEAD = 4;
+const TRAIL_SHIPPED = 'boot-trail.json';                  // round 59: the dist's own trail (ship.py --trail), for a first visit opting in with ?trail=1
+const READER_PLAY_BUDGET = 8 << 20, READER_CLEAR_FRAME = 600;   // round 60: after the boot the Worker keeps only a little read-ahead
+const FS_WINDOW = 1 << 20;                                // the host's window (FS_WIN in host_shims_fs.c)
+const trail = [];                                         // [src, off, len] in read order, until written
+let prefetched = 0, prefetchHits = 0, prefetchMisses = 0, trailKept = 0, trailWritten = false;
+let aheadFetched = 0, readerWaits = 0, readerWaitMs = 0;  // windows read ahead along a file; reads fetched on demand, and the time the engine sat suspended for them
+let trailShipped = false;                                 // the trail came with the dist, not from this browser
+// Round 56: the windows are read by a Worker. isaac_fs_lazy_pread_js is a
+// JSPI import (build_boot.py), so the promise the hook below returns parks
+// the wasm stack mid-read while this thread's loop runs, and the Worker --
+// its own loop free, no base64, no synchronous XHR -- answers with the raw
+// bytes, transferred. It fetches ahead: along the file when the reads are
+// sequential (the mount pass reads each archive front to back), and along
+// the trail the last visit left (round 55), READER_BUDGET bytes at most held
+// or in flight. Round 55's pump delivered 138 of the boot's 442 windows
+// because a delivery needs this thread to yield; a suspended read is one.
+// ?reader=0 keeps the synchronous reads (the A/B, and the fallback where
+// there is no Worker).
+// The reader Worker's whole source is the template literal below, so two
+// characters are forbidden inside it and neither one is a build error:
+//
+//   a backtick ends the template, and
+//   a backslash is eaten as an escape -- the source the Worker receives is the
+//   *cooked* value, three characters shorter than what is written here.
+//
+// Round 84 wrote a Content-Range check here as /\/(\d+)\s*$/. Cooked, that is
+// //(d+)s*$/ -- a line comment. The `const m =` before it dangled, the parser
+// reached the next line and said `Unexpected token 'if'`, and from that round on
+// the Worker never started for anyone: every read went the synchronous way and
+// round 83's retries went with it. Write no backslash in here. If a regex is
+// wanted, do it by hand with indexOf/slice, as that check now does.
+const READER_WORKER = `
+const cache = new Map(), inflight = new Map(), done = new Set();
+let jobs = [], ji = 0, budget = 0, held = 0, inflightBytes = 0, parallel = 4, prefetched = 0, ahead = 0;
+// round 96d: the cap is on downloads; a window waiting only for its decode (a
+// Vorbis window's is asynchronous and slow to answer) holds no slot
+let fetching = 0;
+// Round 77: the chunked build's keystream. Named xorKey rather than key, because
+// a job message already carries a field of that name -- the cache key of the
+// window it wants -- and a handler that greeted every one of those as a new
+// keystream answered no reads at all. Nothing in here may contain a backtick or
+// a backslash -- see the note above the template, which is where the reason can
+// be written down with the characters it is about.
+let xorKey = null;
+// A body or a stream read chunk by chunk into one buffer. Response.arrayBuffer() left a
+// native copy of every window it read in the renderer, freed by no garbage collection
+// (197 MB of it by frame 150 in memory-infra; .scratch/mobile-ui/api-bytes.mjs).
+async function drain(readable) {
+  const rd = readable.getReader(), parts = [];
+  let n = 0;
+  for (;;) {
+    const c = await rd.read();
+    if (c.done) break;
+    parts.push(c.value); n += c.value.length;
+  }
+  if (parts.length === 1) return parts[0];
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const part of parts) { out.set(part, o); o += part.length; }
+  return out;
+}
+async function bodyBuffer(r) {
+  if (!r.body || !r.body.getReader) return r.arrayBuffer();
+  const u = await drain(r.body);
+  return u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : u.slice().buffer;
+}
+function unscramble(buf, pos) {
+  if (!xorKey || pos < 0) return buf;
+  const b = new Uint8Array(buf);
+  for (let i = 0; i < b.length; i++) { const at = pos + i; b[i] ^= xorKey[at & 255] ^ ((at >> 8) & 255); }
+  return b.buffer;
+}
+// Round 96e: a decoded Vorbis window (recipe version 2) is kept in Cache Storage, and
+// the next visit reads it back instead of fetching and decoding it again -- the
+// decode is what a returning player, whose stream B is in the HTTP cache, still paid.
+// The page turns it on ({ decodedCache: { name, prefix } }, the name carrying the
+// release's stream B) when the origin has a gigabyte of quota to spare; caches of
+// other releases are deleted then. The key is the window's own URL without its
+// fragment: chunk, version and window are in it. A hit shorter than the cut is dropped.
+// 0: off (no request from the page), 1: deciding (the quota is being read), 2: on
+let decodedCache = null, decodedReady = Promise.resolve(false), decodedState = 0;
+function keepDecoded(key, w) {
+  if (!decodedCache || !key) return;
+  caches.open(decodedCache.name).then((c) => c.put(key, new Response(w))).catch(() => {});
+}
+function decodedHit(key, need) {
+  if (!key) return Promise.resolve(null);
+  return decodedReady.then((on) => !on ? null : caches.open(decodedCache.name).then((c) =>
+    c.match(key).then((r) => (r ? r.arrayBuffer() : null)).then((b) => {
+      if (!b) return null;
+      if (b.byteLength >= need) return b;
+      c.delete(key).catch(() => {});
+      return null;
+    }))).catch(() => null);
+}
+function useDecodedCache(cfg) {
+  decodedState = 1;
+  decodedReady = ((typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) ? navigator.storage.estimate() : Promise.resolve(null))
+    .then((est) => {
+      if (!est || !(est.quota - est.usage >= 1073741824)) { decodedState = 0; return false; }
+      decodedCache = cfg; decodedState = 2;
+      for (const h of helpers) h.postMessage({ decodedCache: cfg, helper: true });
+      return caches.keys().then((names) => Promise.all(names.filter((n) => n.indexOf(cfg.prefix) === 0 && n !== cfg.name)
+        .map((n) => caches.delete(n)))).then(() => true);
+    }).catch(() => { decodedState = 0; decodedCache = null; return false; });
+}
+// A fetched window, unscrambled, inflated, rebuilt from its recipe and cut; with a
+// key in store, a decoded version 2 recipe window is kept for the next visit.
+function decodeHere(buf, at, packed, from, take, store) {
+  // unscramble hands back an ArrayBuffer, and ArrayBuffer.slice returns
+  // another ArrayBuffer -- which has no .buffer. An uncompressed window
+  // (Vorbis, Theora) skips the inflate below, so it reached the cut still
+  // an ArrayBuffer and every such read came back undefined. Take a view.
+  let win = new Uint8Array(unscramble(buf, at));
+  if (!packed) return Promise.resolve(win.slice(from, from + take).buffer);
+  // into the stream's writer and drained: neither a Blob nor a Response keeps a copy
+  const ds = new DecompressionStream('gzip'), dw = ds.writable.getWriter();
+  dw.write(win).catch(() => {}); dw.close().catch(() => {});
+  return drain(ds.readable).then((out) => {
+    // 2: a window recipe -- plain entry bytes and coded PCM, rebuilt into the
+    // version-0 archive's own bytes by isaacRecipeDecode (recipe.js, appended
+    // to this Worker's source by the page). Round 96d: a recipe with Vorbis in it
+    // answers with a Promise (the browser's decoder is asynchronous).
+    return Promise.resolve(packed === 2 ? isaacRecipeDecode(out) : out).then((w) => {
+      if (store && packed === 2 && out[2] === 2) keepDecoded(store, w);
+      return w.slice(from, from + take).buffer;
+    });
+  });
+}
+// Round 96: the boot's sound preload waited on this Worker decoding recipes --
+// 92-96% busy for that whole stretch while the page's thread sat idle. The
+// fetching stays here, in the trail's order, and the packed windows are decoded
+// by helpers: copies of this script the page asks for ({ helpers: n }), each
+// answering { decode } messages. With none (or none that started) they are
+// decoded here, as before.
+// They are for the boot: the first clear (the boot is over) retires them, each
+// once the decodes it holds have answered (their isolates cost ~32 MB).
+const helpers = [], hwait = new Map();
+let hnext = 0, hseq = 0, retiring = false;
+function retireIdle() {
+  for (let i = helpers.length - 1; i >= 0; i--) {
+    const h = helpers[i];
+    let busy = false;
+    for (const r of hwait.values()) if (r.h === h) { busy = true; break; }
+    if (!busy) { helpers.splice(i, 1); try { h.terminate(); } catch (e) { /* gone */ } }
+  }
+}
+function decodeWin(buf, at, packed, from, take, store) {
+  if (!packed || !helpers.length || retiring) return decodeHere(buf, at, packed, from, take, store);
+  const h = helpers[hnext++ % helpers.length], id = ++hseq;
+  return new Promise((resolve, reject) => {
+    hwait.set(id, { h, resolve, reject });
+    h.postMessage({ decode: id, buf, at, packed, from, take, store }, [buf]);
+  });
+}
+function addHelpers(n) {
+  for (let i = 0; i < n; i++) {
+    let h;
+    try { h = new Worker(self.location.href); } catch (e) { return; }
+    if (xorKey) h.postMessage({ xorKey });
+    if (decodedCache) h.postMessage({ decodedCache, helper: true });
+    h.onmessage = (e) => {
+      const r = hwait.get(e.data.decoded);
+      if (!r) return;
+      hwait.delete(e.data.decoded);
+      if (e.data.buf) r.resolve(e.data.buf); else r.reject(new Error(e.data.err || 'decode failed'));
+      if (retiring) retireIdle();
+    };
+    h.onerror = () => {
+      // a helper that died: its windows fail like a failed fetch, the rest go elsewhere
+      const k = helpers.indexOf(h);
+      if (k >= 0) helpers.splice(k, 1);
+      for (const [id, r] of hwait) if (r.h === h) { hwait.delete(id); r.reject(new Error('decode helper failed')); }
+      try { h.terminate(); } catch (e2) { /* gone */ }
+    };
+    helpers.push(h);
+  }
+}
+function start(key, url, len, why, want) {
+  inflight.set(key, want | 0); held += len; inflightBytes += len;
+  fetching += 1;
+  let fetched = false;
+  const landed = () => { if (!fetched) { fetched = true; fetching -= 1; pump(); } };
+  // round 70: a portable build points several windows at one large chunk and puts
+  // the byte range in the fragment, which no server ever sees. A host that ignores
+  // Range sends the whole chunk, so the body is cut to size here.
+  let init, want0 = -1, want1 = -1, at = -1, chunkBytes = -1;
+  // Round 89: the ranged half stores each 1 MiB window compressed on its own,
+  // so a window is still one contiguous range -- just a shorter one. The
+  // fragment carries that range, the position the keystream needs, whether this
+  // particular window is compressed at all (a Vorbis window is not), and the
+  // cut to make inside the window once it is unwrapped.
+  let winAt = -1, winPacked = 1, winFrom = 0, winTake = 0;
+  const g = url.indexOf('#w=');
+  if (g >= 0) {
+    let frag = url.slice(g + 3);
+    const star = frag.indexOf('*');
+    const cutSpec = frag.slice(star + 1).split('-');
+    winFrom = +cutSpec[0]; winTake = +cutSpec[1];
+    frag = frag.slice(0, star);
+    const bang = frag.indexOf('!');
+    winPacked = +frag.slice(bang + 1);
+    frag = frag.slice(0, bang);
+    const cut = frag.indexOf('@');
+    winAt = +frag.slice(cut + 1);
+    const r = frag.slice(0, cut).split('-');
+    want0 = +r[0]; want1 = +r[1];
+    url = url.slice(0, g);
+    init = { headers: { Range: 'bytes=' + want0 + '-' + want1 } };
+  }
+  const h = url.indexOf('#r=');
+  if (h >= 0) {
+    let frag = url.slice(h + 3);
+    // round 84: the tail after ! is the chunk's own length, and a Content-Range
+    // total that is not it means the host is answering with somebody else's bytes
+    const bang = frag.indexOf('!');
+    if (bang >= 0) { chunkBytes = +frag.slice(bang + 1); frag = frag.slice(0, bang); }
+    const cut = frag.indexOf('@');
+    const r = (cut < 0 ? frag : frag.slice(0, cut)).split('-');
+    want0 = +r[0]; want1 = +r[1];
+    if (cut >= 0) at = +frag.slice(cut + 1);        // where these bytes start in the stream
+    url = url.slice(0, h);
+    init = { headers: { Range: 'bytes=' + want0 + '-' + want1 } };
+  }
+  // Round 83: one fetch that fails must not end the run. A read that comes back
+  // empty returns -1 to the engine, which traps -- and the window that did this
+  // was answered correctly the moment it was asked again, so it was a blip: a
+  // rate limit, a dropped connection, a 5xx. Three tries with a short backoff,
+  // and then the whole chunk, which needs no Range and so cannot be refused for
+  // one.
+  const tries = async () => {
+    let last = null;
+    for (let a = 0; a < 3; a++) {
+      if (a) await new Promise((res) => setTimeout(res, 120 * a * a));
+      try {
+        const r = await fetch(url, init);
+        if (r.ok) {
+          // the host's own answer says which file it thinks it is serving. The
+          // total is read by hand: a regex would need backslashes, and see above.
+          if (r.status === 206 && want0 >= 0) {
+            const cr = (r.headers.get('content-range') || '').trim(), sl = cr.lastIndexOf('/');
+            const total = sl < 0 ? NaN : Number(cr.slice(sl + 1).trim());
+            if (chunkBytes > 0 && Number.isFinite(total) && total !== chunkBytes) {
+              if (r.body) await r.body.cancel().catch(() => {});
+              last = 'the host calls that chunk ' + total + ' bytes, not ' + chunkBytes; break;
+            }
+            const dash = cr.indexOf('-', 6);
+            if (!cr.toLowerCase().startsWith('bytes ') || dash <= 6 || sl <= dash + 1 ||
+                Number(cr.slice(6, dash)) !== want0 || Number(cr.slice(dash + 1, sl)) !== want1) {
+              if (r.body) await r.body.cancel().catch(() => {});
+              throw new Error('the host returned a different byte range');
+            }
+          }
+          const buf = await bodyBuffer(r);
+          if (r.status === 206 && want0 >= 0) {
+            if (buf.byteLength !== want1 - want0 + 1) throw new Error('short or oversized range body');
+            postMessage({ download: { url, from: want0, to: want1 + 1 } });
+          } else if (r.status === 200) postMessage({ download: { url, from: 0, to: buf.byteLength } });
+          return buf;
+        }
+        last = 'HTTP ' + r.status;
+        if (r.body) await r.body.cancel().catch(() => {});
+      } catch (e) { last = (e && e.message) || 'fetch failed'; }
+    }
+    if (want0 < 0) throw new Error(last || 'fetch failed');
+    // no range this time: the whole chunk, cut here
+    const r = await fetch(url);
+    if (!r.ok) {
+      if (r.body) await r.body.cancel().catch(() => {});
+      throw new Error('whole chunk: HTTP ' + r.status);
+    }
+    const buf = await bodyBuffer(r);
+    if (r.status === 200) postMessage({ download: { url, from: 0, to: buf.byteLength } });
+    return buf;
+  };
+  // round 96e: a recipe window may be in the decoded cache from an earlier visit
+  const store = winAt >= 0 && winPacked === 2 ? url : null;
+  // (with the cache off the fetch starts at once, as before)
+  const got = store && decodedState ? () => decodedHit(store, winFrom + winTake).then((hit) => (hit ? { hit } : tries())) : tries;
+  got().then(async (buf) => {
+    landed();
+    if (buf && buf.hit) {
+      // counted as the download it stands for, so the loading bar reads the same
+      postMessage({ download: { url, from: want0, to: want1 + 1 } });
+      buf = buf.hit.slice(winFrom, winFrom + winTake);
+    } else if (buf && winAt >= 0) {
+      // a host that ignored the Range sent the whole chunk: the window's own
+      // bytes still start where the fragment said
+      if (buf.byteLength > want1 - want0 + 1) buf = buf.slice(want0, want1 + 1);
+      buf = await decodeWin(buf, winAt, winPacked, winFrom, winTake, store);
+    }
+    // a host that ignored the Range sent the whole chunk: put it back from the
+    // chunk's own start, then cut out the window
+    else if (buf && want0 >= 0 && buf.byteLength > want1 - want0 + 1) buf = unscramble(buf, at >= 0 ? at - want0 : -1).slice(want0, want1 + 1);
+    else if (buf && at >= 0) buf = unscramble(buf, at);
+    const w = inflight.get(key); inflight.delete(key); held -= len; inflightBytes -= len;
+    if (w) { done.add(key); postMessage({ want: w, buf, hit: why !== 'want', pf: prefetched, ah: ahead }, buf ? [buf] : []); }
+    else if (buf && !done.has(key)) { cache.set(key, buf); held += buf.byteLength; if (why === 'trail') prefetched += 1; else ahead += 1; }
+  }).catch(() => {
+    landed();
+    const w = inflight.get(key); inflight.delete(key); held -= len; inflightBytes -= len;
+    if (w) postMessage({ want: w, buf: null, hit: false, pf: prefetched, ah: ahead });
+  }).finally(pump);
+}
+function pump() {
+  while (fetching < parallel && ji < jobs.length && held < budget) {
+    const [key, url, len] = jobs[ji++];
+    if (!cache.has(key) && !inflight.has(key) && !done.has(key)) start(key, url, len, 'trail', 0);
+  }
+}
+onmessage = (e) => {
+  const d = e.data;
+  if (d.xorKey) { xorKey = new Uint8Array(d.xorKey); for (const h of helpers) h.postMessage({ xorKey }); return; }
+  if (d.decodedCache) {
+    if (d.helper) { decodedCache = d.decodedCache; decodedState = 2; decodedReady = Promise.resolve(true); }
+    else useDecodedCache(d.decodedCache);
+    return;
+  }
+  if (d.decode) {
+    Promise.resolve().then(() => decodeHere(d.buf, d.at, d.packed, d.from, d.take, d.store)).then(
+      (buf) => postMessage({ decoded: d.decode, buf }, [buf]),
+      (e) => postMessage({ decoded: d.decode, err: String((e && e.message) || e) }));
+    return;
+  }
+  if (d.helpers) { addHelpers(d.helpers); return; }
+  if (d.jobs) { jobs = d.jobs; budget = d.budget; parallel = d.parallel; pump(); return; }
+  if (d.clear) { cache.clear(); held = inflightBytes; budget = d.budget; jobs = []; ji = 0; retiring = true; retireIdle(); return; }
+  if (!d.want) return;
+  const buf = cache.get(d.key);
+  if (buf) { cache.delete(d.key); held -= buf.byteLength; done.add(d.key); postMessage({ want: d.want, buf, hit: true, pf: prefetched, ah: ahead }, [buf]); }
+  else if (inflight.has(d.key)) inflight.set(d.key, d.want);
+  else start(d.key, d.url, d.len, 'want', d.want);
+  for (const [k, u, l] of d.ahead || []) if (fetching < parallel && held < budget && !cache.has(k) && !inflight.has(k) && !done.has(k)) start(k, u, l, 'ahead', 0);
+  pump();
+};
+`;
+let reader = null, wantId = 0;
+// Round 59: the trail's prefetch starts at the first presented frame, not at
+// load. On a capped link (200 Mbit/s, the A/B) it competed with the boot's own
+// downloads and pushed the first frame from 6.5 s to 12-13 s; the windows it
+// serves are the title's, read after that frame anyway.
+let trailJobs = null, trailArmed = false;
+const armTrail = (jobs) => {
+  trailJobs = jobs;
+  if (trailArmed && reader && trailJobs && trailJobs.length) { reader.postMessage({ jobs: trailJobs, budget: READER_BUDGET, parallel: READER_PARALLEL }); trailJobs = null; }
+};
+const pendingReads = new Map();                           // id -> { src, off, len, dst, resolve, t0 }
+const lazySizes = new Map();                              // src -> bytes (the instance index): read-ahead stops at a file's end
+const lastRead = new Map();                               // src -> the last window offset: read-ahead follows a sequential file
+const windowUrl = (src, off, len) => {
+  let url = `/instance/${src}?off=${off}&len=${len}`;
+  if (hooks.url) url = hooks.url(url);
+  // round 70: a portable build answers null when it has no URL for a window -- the
+  // caller reads the bytes instead of asking a server that is not there
+  return url === null ? null : new URL(url, location.href).href;
+};
+function finishRead(src, off, dst, bytes) {
+  m.HEAPU8.set(bytes, dst);
+  windowsSeen.add(`${src}@${off}`);
+  preads += 1; preadBytes += bytes.length; lazyByFile.set(src, (lazyByFile.get(src) || 0) + bytes.length);
+  const n = bytes.length;
+  dropBody(bytes);
+  return n;
+}
+function failRead(src, off, len, why) { log(`  lazy pread FAILED for ${src} at ${off}+${len}: ${why}`); return -1; }
+function startReader() {
+  // round 70: a portable build with the payload inline hands out no URLs, so the
+  // Worker has nothing to fetch -- the page says so and the reads stay on the thread
+  if (hooks.noReader) return;
+  if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || params.get('reader') === '0') return;
+  let list = null;
+  try { list = JSON.parse(localStorage.getItem(TRAIL_KEY) || 'null'); } catch (e) { list = null; }
+  if (!Array.isArray(list)) list = [];
+  const jobs = list.map(([src, off, len]) => [`${src}@${off}@${len}`, windowUrl(src, off, len), len]);
+  let w;
+  // the page's recipe decoder (recipe.js, defined by the portable page) goes along, as text
+  const recipeSrc = typeof window.isaacRecipeDecode === 'function' ? '\n' + String(window.isaacRecipeDecode) + '\n' : '';
+  try { w = new Worker(URL.createObjectURL(new Blob([READER_WORKER + recipeSrc], { type: 'text/javascript' }))); } catch (e) { return; }
+  // round 77: a chunked build's payload is scrambled, and a window is a range the
+  // Worker fetches, so the Worker is where it has to be put back
+  if (hooks.chunkKey) w.postMessage({ xorKey: hooks.chunkKey });
+  // round 96e: decoded Vorbis windows kept for the next visit, in a cache named
+  // after the release's stream B (a portable build's base); ?wincache=0 keeps none
+  const pdata = window.__isaacPortableData;
+  if (pdata && pdata.base && params.get('wincache') !== '0' && typeof caches !== 'undefined')
+    w.postMessage({ decodedCache: { name: 'isaac-win-' + pdata.base, prefix: 'isaac-win-' } });
+  // round 96: helpers decode the packed windows beside the reader (its source
+  // above); ?decoders=0 keeps every decode on the reader, as rounds 56-95 did
+  const asked = params.get('decoders'), cores = Number(navigator.hardwareConcurrency) || 2;
+  const decoders = asked !== null && asked !== '' ? Math.max(0, Math.min(8, Math.floor(Number(asked)) || 0)) : Math.max(0, Math.min(4, cores - 2));
+  if (decoders) w.postMessage({ helpers: decoders });
+  trailKept = list.length;
+  reader = w;
+  w.onmessage = (e) => {
+    const d = e.data;
+    if (d.download && hooks.onDownload) hooks.onDownload(d.download.url, d.download.from, d.download.to);
+    if (!d.want) return;
+    const p = pendingReads.get(d.want);
+    if (!p) return;
+    pendingReads.delete(d.want);
+    prefetched = d.pf; aheadFetched = d.ah;
+    if (d.hit) prefetchHits += 1; else { prefetchMisses += 1; readerWaits += 1; readerWaitMs += performance.now() - p.t0; }
+    p.resolve(d.buf ? finishRead(p.src, p.off, p.dst, new Uint8Array(d.buf)) : failRead(p.src, p.off, p.len, 'the reader had no bytes'));
+  };
+  w.onerror = (e) => {
+    // the Worker is gone: the read that waits, and every read after it, goes the synchronous way
+    reader = null;
+    log(`  reader Worker failed (${(e && e.message) || e}); synchronous reads from here`);
+    for (const [id, p] of pendingReads) {
+      pendingReads.delete(id);
+      try { p.resolve(finishRead(p.src, p.off, p.dst, fetchSync(`/instance/${p.src}?off=${p.off}&len=${p.len}`))); } catch (err) { p.resolve(failRead(p.src, p.off, p.len, err.message)); }
+    }
+    try { w.terminate(); } catch (e2) { /* gone */ }
+  };
+  w.postMessage({ jobs: [], budget: READER_BUDGET, parallel: READER_PARALLEL });
+  if (jobs.length) armTrail(jobs);
+  if (!list.length && params.get('trail') === '1') {
+    // Shipped trails are opt-in: their speculative windows compete with cold
+    // demand reads on capped links. This origin's recorded trail stays enabled.
+    // drive_boot records trails; ship.py --trail supplies the optional trace.
+    let url = TRAIL_SHIPPED;
+    if (hooks.url) url = hooks.url(url);
+    // round 70: a portable build carries the trail in the page, so there is
+    // nothing to fetch for it
+    if (hooks.trail) {
+      const jobs = hooks.trail
+        .map(([src, off, len]) => [`${src}@${off}@${len}`, windowUrl(src, off, len), len])
+        .filter(([, u]) => u);
+      trailKept = jobs.length; trailShipped = true;
+      armTrail(jobs);
+      return;
+    }
+    fetch(new URL(url, location.href).href).then((r) => (r.ok ? r.json() : null)).then((shipped) => {
+      if (!Array.isArray(shipped) || !shipped.length || reader !== w) return;
+      trailKept = shipped.length; trailShipped = true;
+      armTrail(shipped.map(([src, off, len]) => [`${src}@${off}@${len}`, windowUrl(src, off, len), len]));
+    }).catch(() => { /* no shipped trail: the visit is cold */ });
+  }
+}
+function writeTrail() {
+  if (trailWritten) return;
+  trailWritten = true;
+  try { localStorage.setItem(TRAIL_KEY, JSON.stringify(trail)); } catch (e) { /* no storage: the next visit is cold too */ }
+}
+// ---- the run's trail -----------------------------------------------------------------
+// The first run of a visit read its windows one at a time as the engine asked
+// (measured on tboi.online: 18 windows, 18 MB, a 5 to 9 s freeze at the first
+// room while the menu's music ran dry). The windows are the same run to run:
+// this browser keeps the ones its first run read, a build can ship a list for a
+// first visit (hooks.runTrail: the start and the first floor's three looks, 24
+// windows), and once the boot's own reads are done the Worker fetches them while
+// the player is still on the menus. A window the engine has read is never asked
+// for twice (the Worker's done set).
+const RUN_TRAIL_KEY = 'isaac-run-trail', RUN_TRAIL_MAX = 48, RUN_TRAIL_ARM_FRAME = 300, RUN_TRAIL_UNTIL = 300;
+const runTrail = [], runTrailSeen = new Set();
+let runRecording = false, runRecorded = false, runArmed = false;
+function storedRunTrail() {
+  try { const l = JSON.parse(localStorage.getItem(RUN_TRAIL_KEY) || 'null'); return Array.isArray(l) ? l : []; } catch (e) { return []; }
+}
+function saveRunTrail() {
+  if (!runTrail.length) return;
+  const seen = new Set(), merged = [];
+  for (const w of [...runTrail, ...storedRunTrail()]) {
+    if (!Array.isArray(w) || w.length !== 3) continue;
+    const k = w.join('@');
+    if (seen.has(k) || merged.length >= RUN_TRAIL_MAX) continue;
+    seen.add(k); merged.push(w);
+  }
+  try { localStorage.setItem(RUN_TRAIL_KEY, JSON.stringify(merged)); } catch (e) { /* no storage: the next visit is cold */ }
+}
+function armRunTrail() {
+  runArmed = true;
+  if (!reader) return;
+  const seen = new Set(), jobs = [];
+  let bytes = 0;
+  for (const w of [...storedRunTrail(), ...(Array.isArray(hooks.runTrail) ? hooks.runTrail : [])]) {
+    if (!Array.isArray(w) || w.length !== 3) continue;
+    const [src, off, len] = w, key = `${src}@${off}@${len}`, url = windowUrl(src, off, len);
+    if (seen.has(key) || !url || jobs.length >= RUN_TRAIL_MAX) continue;
+    seen.add(key); jobs.push([key, url, len]); bytes += len;
+  }
+  // the boot's leftovers go (round 60's clear, early), the run's windows come in their place
+  reader.postMessage({ clear: true, budget: READER_PLAY_BUDGET + bytes });
+  if (jobs.length) reader.postMessage({ jobs, budget: READER_PLAY_BUDGET + bytes, parallel: READER_PARALLEL });
+  runPrefetched = jobs.length;
+}
+let runPrefetched = 0;
+window.isaacRunTrail = () => ({ recording: runRecording, recorded: runRecorded, read: runTrail.length, armed: runArmed, prefetched: runPrefetched, stored: storedRunTrail().length });
+startReader();
+window.addEventListener('pagehide', () => { writeTrail(); saveRunTrail(); if (reader) reader.terminate(); });   // a short visit still leaves its trail
+cfg.isaacLazyPread = (src, dst, off, len) => {
+  // round 107: a packed mod's file -- the header blob or a pack at hand answers
+  // now, anything else suspends the read until its pack is here
+  if (packedMods && packedMods.owns(src)) {
+    const put = (b) => { m.HEAPU8.set(b, dst); return b.length; };
+    try {
+      const got = packedMods.pread(src, off, len);
+      if (got && typeof got.then === 'function') return got.then(put, (e) => failRead(src, off, len, e.message));
+      return put(got);
+    } catch (e) { return failRead(src, off, len, e.message); }
+  }
+  try {
+    if (!trailWritten && trail.length < TRAIL_MAX) trail.push([src, off, len]);
+    // after the boot, until the first run has played a while: the run's windows
+    if (runRecording && runTrail.length < RUN_TRAIL_MAX) {
+      const k = `${src}@${off}@${len}`;
+      if (!runTrailSeen.has(k)) { runTrailSeen.add(k); runTrail.push([src, off, len]); }
+    }
+    if (!trailWritten && (window.isaacFrame | 0) >= 300) writeTrail();
+    if (preadTrail.length < 60) preadTrail.push(`${src.replace(/^.*\//, '')}@${(off / 1048576).toFixed(0)}`);
+    if (preadStacks.length < 3 && preads > 6) preadStacks.push((new Error().stack || '').split('\n').slice(1, 16).map((l) => l.trim().replace(/^at /, '').replace(/ \(.*$/, '')).join(' < '));
+    const wantUrl = reader ? windowUrl(src, off, len) : null;
+    if (reader && wantUrl) {
+      const key = `${src}@${off}@${len}`, ahead = [];
+      // forward through the file, by up to READ_AHEAD windows (the mount pass
+      // reads each entry's start in offset order; an entry of a few MB skips
+      // windows): the next READ_AHEAD windows are asked for ahead of the engine
+      const last = lastRead.has(src) ? lastRead.get(src) : -FS_WINDOW;
+      const forward = off > last && off - last <= READ_AHEAD * FS_WINDOW;
+      lastRead.set(src, off);
+      if (forward && len === FS_WINDOW) {
+        const size = lazySizes.get(src) || 0;
+        for (let k = 1; k <= READ_AHEAD; k++) {
+          const o = off + k * FS_WINDOW;
+          if (o >= size) break;
+          const l = Math.min(FS_WINDOW, size - o);
+          const au = windowUrl(src, o, l);
+          if (au) ahead.push([`${src}@${o}@${l}`, au, l]);
+        }
+      }
+      return new Promise((resolve) => {
+        const id = ++wantId;
+        pendingReads.set(id, { src, off, len, dst, resolve, t0: performance.now() });
+        reader.postMessage({ want: id, key, url: wantUrl, len, ahead });
+      });
+    }
+    // round 70: a build with the payload inline has no server to read from
+    if (hooks.preadBytes) {
+      const got = hooks.preadBytes(src, off, len);
+      if (got && typeof got.then === 'function') return got.then((b) => (b ? finishRead(src, off, dst, b) : failRead(src, off, len, 'no bytes')));
+      if (got) return finishRead(src, off, dst, got);
+    }
+    return finishRead(src, off, dst, fetchSync(`/instance/${src}?off=${off}&len=${len}`));
+  } catch (e) {
+    return failRead(src, off, len, e.message);
+  }
+};
+let presented = 0;
+const keepEvery = Number(params.get('keep') || '0');      // also keep every Nth frame
+const frameBudget = Number(params.get('frames') || (params.get('ISAAC_YIELD') === '1' ? '100000000' : '5'));
+// Which frames are worth reading back off the GPU. The host asks before it
+// spends a 2 MB glReadPixels on a frame nobody keeps (round 17): the sampled
+// ones, and the tail that ends up in isaacFrames anyway.
+let wantedFrame = 0;                                      // the host's frame number for the next present
+// An interactive page (ISAAC_YIELD=1, round 25) reads back only explicitly
+// sampled frames: the 2 MB glReadPixels per present exists for the headless
+// runner's PNGs, and nothing collects the tail from a served page.
+const interactive = params.get('ISAAC_YIELD') === '1';
+cfg.isaacWantsFrame = (n) => {
+  window.isaacFrame = n;
+  if (n >= 300 && !trailWritten) writeTrail();            // round 55: the boot's windows, kept for the next visit
+  if (!trailArmed) { trailArmed = true; if (trailJobs) armTrail(trailJobs); }   // round 59: the prefetch starts here
+  // round 60: the boot is over by frame 600 (the title up, its resources read): the
+  // Worker drops the windows it fetched ahead and never handed over (up to the
+  // 128 MB budget -- ~80 MB of the renderer's working set) and keeps 8 MB of
+  // read-ahead for play; the trail's leftovers go with them
+  if (n === READER_CLEAR_FRAME && packedMods) packedMods.release();   // round 107: the eager lane has done its work
+  // round 108: the boot's own reads are done: the rest of the packed mods comes in two at a time
+  if (n === READER_CLEAR_FRAME && packedMods && packDownloader) packDownloader.pace(0);
+  if (n === READER_CLEAR_FRAME && reader && !runArmed) { reader.postMessage({ clear: true, budget: READER_PLAY_BUDGET }); trailJobs = null; }
+  // the same moment for the portable page's cached whole-read chunks (stream A: the
+  // engine, the image, the eagerly seeded archives), spent once the boot is over
+  if (n === READER_CLEAR_FRAME && window.isaacPortable && typeof window.isaacPortable.release === 'function') {
+    try { const r = window.isaacPortable.release(); log(`  released the boot's chunks: ${(r.freed / 1048576).toFixed(0)} MB, ${r.kept} small files kept`); } catch (e) { /* they stay cached */ }
+  }
+  // the run's trail: fetched from here, recorded from here until the first run is
+  // RUN_TRAIL_UNTIL game frames in (Game+0x264f8, the same counter readReadyState uses)
+  if (n >= RUN_TRAIL_ARM_FRAME && !runArmed) { trailJobs = null; armRunTrail(); runRecording = !runRecorded; }
+  if (runRecording && n % 30 === 0) {
+    try {
+      const G = window.isaacGuest, game = G && G.u32(0x00c71678);
+      if (game && G.u32(game + 0x264f8) > RUN_TRAIL_UNTIL) { runRecording = false; runRecorded = true; saveRunTrail(); }
+    } catch (e) { /* the guest is not up: keep recording */ }
+  }
+  const want = interactive ? (keepEvery ? n % keepEvery === 0 : false)
+    : (keepEvery ? (n % keepEvery === 0) : true) || n + KEEP_FRAMES >= frameBudget;
+  if (want) wantedFrame = n;
+  return want;
+};
+cfg.isaacPresent = (ptr, w, h) => {
+  presented += 1;
+  // number the frame by the HOST's counter, not by how many were captured:
+  // the readback is skipped for frames nobody keeps (round 17), so the two
+  // no longer march together and the sampling below depends on the real one.
+  const frame = { n: wantedFrame || presented, w, h, rgba: m.HEAPU8.slice(ptr, ptr + w * h * 4) };
+  window.isaacFrames.push(frame);
+  // the last KEEP_FRAMES always survive; sampled frames are pinned
+  const pinned = window.isaacFrames.filter((f) => keepEvery && f.n % keepEvery === 0);
+  const tail = window.isaacFrames.filter((f) => !(keepEvery && f.n % keepEvery === 0)).slice(-KEEP_FRAMES);
+  window.isaacFrames = [...pinned, ...tail].sort((a, b) => a.n - b.n);
+};
+
+// ---- scripted input ---------------------------------------------------------
+// Without ISAAC_YIELD=1 the page's main thread is inside main() for the whole
+// run, so no browser event can reach the game; input is then a timeline keyed
+// by presented frame (with ISAAC_YIELD=1 the live queue below is served first):
+//   ?input=130:Enter,160:Enter,200:Down,230:Enter,300:mouse:480:270,301:click,400:w:30
+// A key entry presses at its frame and releases `hold` frames later (default 2). The host's
+// PeekMessageW asks Module.isaacInputPoll(frame, out) for the events due at
+// or before `frame`, one per call, packed as four int32s at `out`:
+//   [1, vk, scancode | (extended << 8), down]   key
+//   [2, x, y, 0]                                 mouse move (client coords)
+//   [3, button, down, 0]                         mouse button (0 left, 1 right)
+const KEYS = {
+  enter: [0x0D, 0x1C, 0], escape: [0x1B, 0x01, 0], space: [0x20, 0x39, 0], tab: [0x09, 0x0F, 0],
+  backspace: [0x08, 0x0E, 0], up: [0x26, 0x48, 1], down: [0x28, 0x50, 1], left: [0x25, 0x4B, 1],
+  right: [0x27, 0x4D, 1], shift: [0x10, 0x2A, 0], ctrl: [0x11, 0x1D, 0], alt: [0x12, 0x38, 0],
+  a: [0x41, 0x1E, 0], b: [0x42, 0x30, 0], c: [0x43, 0x2E, 0], d: [0x44, 0x20, 0], e: [0x45, 0x12, 0],
+  f: [0x46, 0x21, 0], g: [0x47, 0x22, 0], h: [0x48, 0x23, 0], i: [0x49, 0x17, 0], j: [0x4A, 0x24, 0],
+  k: [0x4B, 0x25, 0], l: [0x4C, 0x26, 0], m: [0x4D, 0x32, 0], n: [0x4E, 0x31, 0], o: [0x4F, 0x18, 0],
+  p: [0x50, 0x19, 0], q: [0x51, 0x10, 0], r: [0x52, 0x13, 0], s: [0x53, 0x1F, 0], t: [0x54, 0x14, 0],
+  u: [0x55, 0x16, 0], v: [0x56, 0x2F, 0], w: [0x57, 0x11, 0], x: [0x58, 0x2D, 0], y: [0x59, 0x15, 0],
+  z: [0x5A, 0x2C, 0], '0': [0x30, 0x0B, 0], '1': [0x31, 0x02, 0], '2': [0x32, 0x03, 0], '3': [0x33, 0x04, 0],
+  '4': [0x34, 0x05, 0], '5': [0x35, 0x06, 0], '6': [0x36, 0x07, 0], '7': [0x37, 0x08, 0], '8': [0x38, 0x09, 0],
+  '9': [0x39, 0x0A, 0], f1: [0x70, 0x3B, 0], f2: [0x71, 0x3C, 0], f3: [0x72, 0x3D, 0], f4: [0x73, 0x3E, 0],
+  grave: [0xC0, 0x29, 0],      // the debug console key (GLFW_KEY_GRAVE_ACCENT; the same row as explore.mjs)
+  // Round 47: the punctuation row, the same names and codes as explore.mjs -- a
+  // typed console command has dots (`goto s.boss.1010` lost its dots: the live
+  // keyboard path dropped every key the table did not name)
+  minus: [0xBD, 0x0C, 0], equals: [0xBB, 0x0D, 0], lbracket: [0xDB, 0x1A, 0],
+  rbracket: [0xDD, 0x1B, 0], backslash: [0xDC, 0x2B, 0], semicolon: [0xBA, 0x27, 0], quote: [0xDE, 0x28, 0],
+  comma: [0xBC, 0x33, 0], period: [0xBE, 0x34, 0], slash: [0xBF, 0x35, 0],
+};
+const timeline = [];
+for (const item of (params.get('input') || '').split(',').map((t) => t.trim()).filter(Boolean)) {
+  const [fr, what, ...rest] = item.split(':');
+  const frame = Number(fr);
+  const w = (what || '').toLowerCase();
+  if (w === 'mouse') timeline.push({ frame, ev: [2, Number(rest[0] || 0), Number(rest[1] || 0), 0] });
+  else if (w === 'click' || w === 'rclick') {
+    const btn = w === 'click' ? 0 : 1;
+    timeline.push({ frame, ev: [3, btn, 1, 0] });
+    timeline.push({ frame: frame + 2, ev: [3, btn, 0, 0] });
+  } else if (KEYS[w]) {
+    const [vk, sc, ext] = KEYS[w];
+    const hold = Math.max(1, Number(rest[0] || 2));      // frame:key[:hold] -- held for `hold` frames
+    timeline.push({ frame, ev: [1, vk, sc | (ext << 8), 1] });
+    timeline.push({ frame: frame + hold, ev: [1, vk, sc | (ext << 8), 0] });
+  } else log(`  input: unknown key '${what}' in '${item}'`);
+}
+timeline.sort((a, b) => a.frame - b.frame);
+let inputsDelivered = 0;
+// Round 25: live input. With ISAAC_YIELD=1 the module yields to the event loop
+// every frame, so DOM events reach the page while the game runs; they queue
+// here and are delivered ahead of the scripted timeline. Keys map through the
+// same table by event.code (KeyA -> a, ArrowUp -> up, Enter, Space, ...).
+const live = [];
+// Live keyboard and injected input own their holds independently. A touch reset
+// must not release a physical key, or another injected source's key.
+const keyOwners = new Map(), physicalKeys = new Map();
+function nativeKey(name, down, source) {
+  let owners = keyOwners.get(name);
+  if (down) {
+    if (owners) { owners.add(source); return; }
+    keyOwners.set(name, new Set([source]));
+  } else {
+    if (!owners || !owners.delete(source)) return;
+    if (owners.size) return;
+    keyOwners.delete(name);
+  }
+  const [vk, sc, ext] = KEYS[name];
+  live.push([1, vk, sc | (ext << 8), down ? 1 : 0]);
+}
+const CODE_TO_KEY = { Enter: 'enter', Escape: 'escape', Space: 'space', Tab: 'tab', Backspace: 'backspace',
+  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', ShiftLeft: 'shift', ShiftRight: 'shift',
+  ControlLeft: 'ctrl', ControlRight: 'ctrl', AltLeft: 'alt', AltRight: 'alt', Backquote: 'grave',
+  Minus: 'minus', Equal: 'equals', BracketLeft: 'lbracket', BracketRight: 'rbracket', Backslash: 'backslash',
+  Semicolon: 'semicolon', Quote: 'quote', Comma: 'comma', Period: 'period', Slash: 'slash' };
+function keyName(ev) {
+  const c = ev.code || '';
+  if (CODE_TO_KEY[c]) return CODE_TO_KEY[c];
+  if (/^Key[A-Z]$/.test(c)) return c[3].toLowerCase();
+  if (/^Digit[0-9]$/.test(c)) return c[5];
+  if (/^F([1-4])$/.test(c)) return c.toLowerCase();
+  return null;
+}
+const KEY_TO_CODE = {};
+for (const [code, name] of Object.entries(CODE_TO_KEY)) {
+  if (!KEY_TO_CODE[name]) KEY_TO_CODE[name] = code;
+}
+const KEY_VALUE = { space: ' ', ctrl: 'Control', shift: 'Shift', alt: 'Alt' };
+function injectedEvent(name) {
+  const code = KEY_TO_CODE[name] || (/^[a-z]$/.test(name) ? `Key${name.toUpperCase()}`
+    : /^[0-9]$/.test(name) ? `Digit${name}` : name.toUpperCase());
+  return { code, key: KEY_VALUE[name] || (name.length === 1 ? name : code), repeat: false, preventDefault() {} };
+}
+window.isaacInjectKey = (name, down, source = 'injected') => {
+  name = String(name).toLowerCase();
+  if (!KEYS[name]) return;
+  // Release native ownership before capture: a menu can open after key-down.
+  if (!down) nativeKey(name, false, source);
+  if (source === 'touch' && typeof window.isaacKeyCapture === 'function'
+    && window.isaacKeyCapture(injectedEvent(name), !!down)) return;
+  // The original two-argument API deliberately bypasses capture: EDIT FILE's
+  // Delete confirmation is addressed to the native menu, not the JS paper.
+  if (down) nativeKey(name, true, source);
+};
+const canvasEl = document.getElementById('canvas');
+function onKey(ev, down) {
+  const k = keyName(ev), source = `keyboard:${ev.code}`;
+  if (!down && k) {
+    nativeKey(k, false, source);
+    physicalKeys.delete(source);
+  }
+  const target = ev.target, saves = document.getElementById('saves');
+  if (ev.defaultPrevented || (saves && saves.open) || (target && (target.isContentEditable
+    || (target.closest && target.closest('input, textarea, select, [data-touch-ui]'))))) return;
+  // Page menus may repeat navigation keys, but native input remains edge-based.
+  if (typeof window.isaacKeyCapture === 'function' && window.isaacKeyCapture(ev, down)) { ev.preventDefault(); return; }
+  if (!k || !KEYS[k]) return;
+  if (ev.repeat) { ev.preventDefault(); return; }
+  if (down) {
+    physicalKeys.set(source, k);
+    nativeKey(k, true, source);
+  }
+  ev.preventDefault();
+}
+function releasePhysicalKeys() {
+  for (const [source, name] of physicalKeys) nativeKey(name, false, source);
+  physicalKeys.clear();
+}
+window.addEventListener('blur', releasePhysicalKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releasePhysicalKeys(); });
+// Autoplay policy: an AudioContext created before the first user gesture
+// starts suspended, and resume() is honoured once the page has a user
+// activation. The first key press (or click) is that activation; resume
+// right there so the title music is not waiting for the next play call.
+const resumeAudio = () => {
+  try { const A = m.isaacAudio; if (A && A.ctx && A.ctx.state === 'suspended') A.ctx.resume(); } catch (e) { /* audio never traps the page */ }
+};
+// Round 36: a level meter on the master output. The proof that music plays
+// is energy, not log lines: the WebAudio backend (host_audio_web.c) routes
+// every source through Module.isaacAudio.master and calls
+// Module.isaacAudioReady(A) once the AudioContext exists. The analyser measures
+// the live mixer before the page's output-only loading gate, keeping the RMS of
+// the last second (100 ms blocks while the JSPI page yields each frame).
+// window.isaacAudioLevel() answers a driver:
+//   { rms, rmsNow, peak, blocks, ctxTime, state, sampleRate, scheduled, played, streams }
+// rms is the last second, rmsNow the freshest block (always current, timers
+// or not), peak the last second's peak sample.
+let audioTap = null;
+cfg.isaacAudioReady = (A) => {
+  try {
+    A.master.disconnect();
+    if (audioTap) { clearInterval(audioTap.timer); audioTap = null; }
+    const an = A.ctx.createAnalyser();
+    an.fftSize = 8192;                                   // 171 ms per read at 48 kHz
+    const output = A.outputGain = A.ctx.createGain();
+    const pageReady = typeof hooks.onAudioReady === 'function';
+    output.gain.value = pageReady ? 0 : 1;
+    if (pageReady) hooks.onAudioReady(A);
+    A.master.connect(an);
+    an.connect(output);
+    output.connect(A.ctx.destination);
+    const buf = new Float32Array(an.fftSize);
+    const blocks = [];
+    const sample = () => {
+      an.getFloatTimeDomainData(buf);
+      let ss = 0, pk = 0;
+      for (let i = 0; i < buf.length; i++) { const v = buf[i]; ss += v * v; const a = v < 0 ? -v : v; if (a > pk) pk = a; }
+      const b = { t: performance.now(), ms: ss / buf.length, peak: pk };
+      blocks.push(b);
+      while (blocks.length && blocks[0].t < b.t - 1000) blocks.shift();
+      return b;
+    };
+    audioTap = { A, sample, blocks, timer: setInterval(sample, 100) };
+    log(`  audio tap: analyser on the master output (${A.ctx.sampleRate} Hz, ${A.ctx.state})`);
+  } catch (e) { log(`  audio tap failed: ${e.message}`); }
+};
+window.isaacAudioLevel = () => {
+  if (!audioTap) return null;
+  const b = audioTap.sample();
+  const bl = audioTap.blocks;
+  let ms = 0, peak = 0;
+  for (const x of bl) { ms += x.ms; if (x.peak > peak) peak = x.peak; }
+  const A = audioTap.A;
+  let streams = 0;
+  A.sources.forEach((s) => { if (s.playing) streams += 1; });
+  return { rms: Math.sqrt(ms / bl.length), rmsNow: Math.sqrt(b.ms), peak, blocks: bl.length,
+           ctxTime: A.ctx.currentTime, state: A.ctx.state, sampleRate: A.ctx.sampleRate,
+           scheduled: A.scheduled || 0, played: A.played || 0, streams };
+};
+window.addEventListener('keydown', (ev) => { resumeAudio(); onKey(ev, true); });
+window.addEventListener('pointerdown', resumeAudio);
+// Capture key-up before a focused page dialog can stop propagation.
+window.addEventListener('keyup', (ev) => onKey(ev, false), true);
+canvasEl.addEventListener('mousemove', (ev) => {
+  const r = canvasEl.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) * canvasEl.width / r.width);
+  const y = Math.round((ev.clientY - r.top) * canvasEl.height / r.height);
+  // coalesce: the newest position replaces a still-queued move
+  if (live.length && live[live.length - 1][0] === 2) live[live.length - 1] = [2, x, y, 0];
+  else live.push([2, x, y, 0]);
+});
+canvasEl.addEventListener('mousedown', (ev) => { live.push([3, ev.button === 2 ? 1 : 0, 1, 0]); ev.preventDefault(); });
+canvasEl.addEventListener('mouseup', (ev) => { live.push([3, ev.button === 2 ? 1 : 0, 0, 0]); ev.preventDefault(); });
+canvasEl.addEventListener('contextmenu', (ev) => ev.preventDefault());
+canvasEl.tabIndex = 0;
+canvasEl.focus();
+cfg.isaacInputPoll = (frame, out) => {
+  if (live.length) {
+    m.HEAP32.set(live.shift(), out >> 2);
+    inputsDelivered += 1;
+    return 1;
+  }
+  if (!timeline.length || timeline[0].frame > frame) return 0;
+  const { ev } = timeline.shift();
+  m.HEAP32.set(ev, out >> 2);
+  inputsDelivered += 1;
+  return 1;
+};
+
+let m;
+try {
+  m = await Module(cfg);
+} catch (e) {
+  log(`module instantiation failed: ${e.message}`);
+  window.isaacDone = { error: `instantiate: ${e.message}` };
+  throw e;
+}
+
+// Round 87: the page can read guest memory, because in this port a guest VA IS
+// a wasm linear-memory address -- `isaac_g(va)` is the identity (isaac_host.h),
+// which is what GLOBAL_BASE is chosen to buy. That makes engine state readable
+// from here for a few bytes a frame and no host call: the title-screen credit
+// asks whether a run is up by looking at the game's own pointer.
+// HEAPU8 is the only view this build exports (touching m.HEAPU32 aborts the
+// runtime with "'HEAPU32' was not exported"), so the word is assembled here.
+window.isaacGuest = {
+  u8: (va) => { const H = m && m.HEAPU8; return H ? H[va >>> 0] : 0; },
+  u32: (va) => {
+    const H = m && m.HEAPU8;
+    if (!H) return 0;
+    va >>>= 0;
+    return (H[va] | (H[va + 1] << 8) | (H[va + 2] << 16) | (H[va + 3] << 24)) >>> 0;
+  },
+};
+// The guest heap's high-water report on demand, into the log like the one at
+// exit: a long session's peak against the arena without ending the session.
+window.isaacHeapReport = () => { try { m._isaac_heap_report(); return true; } catch (e) { return false; } };
+
+async function stageOk(name, fn) {
+  log(`=== ${name} ===`);
+  try {
+    return await fn();
+  } catch (e) {
+    log(`  TRAP in ${name}: ${e.message}`);
+    try { if (typeof m._isaac_dump_va_ring === 'function') m._isaac_dump_va_ring(); } catch (e2) { /* best effort */ }
+    log(String(e.stack || '').split('\n').slice(1, 4).join('\n'));
+    return null;
+  }
+}
+function cstr(s) {
+  const bytes = new TextEncoder().encode(s + '\0');
+  const p = m._malloc(bytes.length);
+  if (!p) throw new Error('path allocation failed');
+  try {
+    m.HEAPU8.set(bytes, p);
+    return p;
+  } catch (e) {
+    m._free(p);
+    throw e;
+  }
+}
+function seedFile(path, bytes) {
+  const pp = cstr(path);
+  let dp = 0;
+  try {
+    if (bytes.length) {
+      dp = m._malloc(bytes.length);
+      if (!dp) throw new Error('seed data allocation failed');
+      m.HEAPU8.set(bytes, dp);
+    }
+    const ok = m._isaac_fs_seed_adopt(pp, dp, bytes.length);
+    if (ok) dp = 0; // The filesystem owns the allocation after success.
+    return ok;
+  } finally {
+    if (dp) m._free(dp);
+    m._free(pp);
+  }
+}
+
+const done = { mainRc: null, bootRc: null, presented: 0, lazyReads: 0, lazyBytes: 0 };
+try {
+  // --- memory image
+  const blob = await fetchBytes('/isaac.segs.bin');
+  const p = m._malloc(blob.length);
+  m.HEAPU8.set(blob, p);
+  const nseg = await stageOk('place memory image', () => m._isaac_place_image(p, blob.length));
+  log(`  isaac.segs.bin ${blob.length} bytes -> ${nseg} segments`);
+  m._free(p);
+  dropBody(blob);                                           // round 60: this frame lives as long as main() does
+  if (nseg === null || nseg < 0) throw new Error('image placement failed');
+
+  // --- layout + guard
+  const layoutBad = await stageOk('layout', () => m._isaac_layout_check());
+  m._isaac_guard_arm();
+  log(`  guard armed (layout ${layoutBad ? 'FAIL' : 'OK'})`);
+
+  // --- seed the packed archives eagerly, the tree lazily
+  // music/videos since round 15d; the DLC set since round 24e (windowed --
+  // see cfg.isaacLazyPread). The language packs are deliberately absent: a
+  // mounted pack would shadow English assets (the mount loop overwrites an
+  // equal-hash entry).
+  // (repentance.a is not listed: this exe never names it -- round 26)
+  const LAZY_ARCHIVES = new Set(['resources/packed/music.a', 'resources/packed/videos.a',
+    'resources/packed/afterbirth.a', 'resources/packed/afterbirthp.a']);
+  const index = JSON.parse(new TextDecoder().decode(await fetchBytes('/instance_index.json')));
+  await stageOk('seed packed archives', async () => {
+    let n = 0;
+    // round 99: the two windowed sound archives' WAV header overlays (wav_overlay.py): the
+    // boot parses every sample's header, and these answer it without a window
+    for (const name of ['graphics.a', 'config.a', 'fonts.a', 'animations.a', 'rooms.a', 'sfx.a', 'afterbirthp.a.ovl', 'afterbirth.a.ovl']) {
+      const rel = `resources/packed/${name}`;
+      let bytes;
+      try { bytes = await fetchBytes(`/instance/${rel}`); } catch { log(`  (skip ${name}: not served)`); continue; }
+      const size = bytes.length;
+      let ok;
+      try { ok = seedFile(rel, bytes); } finally { dropBody(bytes); }
+      log(`  seed ${rel} ${size} bytes -> ${ok ? 'ok' : 'FAIL'}`);
+      n += ok ? 1 : 0;
+    }
+    return n;
+  });
+  await stageOk('register instance tree lazily', () => {
+    let files = 0, bytes = 0;
+    for (const { p: rel, s: size } of index) {
+      lazySizes.set(rel, size);                           // round 56: the reader's read-ahead stops at the end of a file
+      // packed/ is seeded eagerly above -- except the two archives the game
+      // opens only once it is playing (music 182 MB, videos 93 MB), which get
+      // the same lazy treatment as the tree so they cost nothing until asked
+      // for. Node does the same (round 15d).
+      if (rel.startsWith('resources/packed/') && !LAZY_ARCHIVES.has(rel)) continue;
+      const pp = cstr(rel);
+      try {
+        if (m._isaac_fs_seed_lazy(pp, size)) { files += 1; bytes += size; }
+      } finally {
+        m._free(pp);
+      }
+    }
+    log(`  registered ${files} files lazily (${(bytes / 1048576).toFixed(1)} MB)`);
+    return files;
+  });
+  // --- round 31: the saves of earlier loads come back from IndexedDB (after
+  // the instance tree, so a saved file wins over a seeded one)
+  await stageOk('restore saves', async () => {
+    if (!persistOn) { log('  persist=0: the save store is off'); return 0; }
+    try { saveDb = await openSaveDb(); } catch (e) { log(`  save store unavailable: ${e.message}`); return 0; }
+    if (!saveDb) { log('  no IndexedDB here: saves live for this load only'); return 0; }
+    const saved = await readSaves();
+    let n = 0;
+    for (const { key, src, bytes } of saved) {
+      const rel = src || key;
+      const size = bytes.length;
+      let ok;
+      try { ok = seedFile(rel, bytes); } finally { dropBody(bytes); }
+      if (ok) n += 1;
+      log(`  restored ${rel} (${size} bytes) -> ${ok ? 'ok' : 'FAIL'}`);
+    }
+    log(`  ${n} saved file(s) restored from the store`);
+    return n;
+  });
+  // --- round 74: mods from this browser, seeded where the engine scans for them.
+  // After the saves, and into a directory tree of its own: every path is built
+  // from an id and a relative name the store already checked, so no mod decides
+  // where its bytes land.
+  await stageOk('seed mods', async () => {
+    if (!modsOn) { log('  mods=0: no mods, and no import row'); return 0; }
+    try { modDb = await openModDb(); } catch (e) { log(`  mod store unavailable: ${e.message}`); modDb = null; }
+    // Round 85: a mod's Lua is opened by the host Lua's own libc, which reads
+    // through MEMFS -- the same reason the game's own scripts are copied there
+    // in the next stage. Seeding into the FS shim is not enough: the engine ran
+    // the mod and Lua answered `cannot open //mods/<id>/main.lua: No such file
+    // or directory`. So every .lua a mod carries goes to MEMFS as well, under
+    // the path the engine asks for (`/mods/<id>/...`, which is what `//mods/...`
+    // normalises to).
+    let luaFiles = 0;
+    const memfs = (key, bytes) => {
+      if (!/\.lua$/i.test(key)) return;
+      const at = String(key).replace(/^c:\/isaac\//i, '/').replace(/\/{2,}/g, '/');
+      if (at[0] !== '/') return;
+      try {
+        m.FS.mkdirTree(at.slice(0, at.lastIndexOf('/')));
+        m.FS.writeFile(at, bytes);
+        luaFiles += 1;
+      } catch (e) { log(`  ${at}: ${e.message}`); }
+    };
+    const seed = (path, bytes) => {
+      const ok = seedFile(path, bytes);
+      if (ok) memfs(path, bytes);
+      return !!ok;
+    };
+    // A page with a catalogue has the MOD BROWSER paper on the MODS screen (play.mjs),
+    // and the browser adds a .zip too, so the IMPORT MOD row would be a second way
+    // in to the same place: it is seeded only where there is no browser.
+    const modBrowser = !!(params.get('catalogue') || window.isaacModCatalogue);
+    const r = await seedMods(modDb, seed, log, { sentinel: !modBrowser });
+    log(`  ${r.mods} mod(s), ${r.files} file(s), ${(r.bytes / 1048576).toFixed(2)} MB`
+      + (r.off ? `, ${r.off} off` : '') + (r.state ? `, ${r.state} state file(s)` : '')
+      + (r.skipped ? `, ${r.skipped} skipped` : '')
+      + (luaFiles ? `, ${luaFiles} lua into MEMFS` : ''));
+    return r.files;
+  });
+  // --- round 107: packed mods (a catalogue's large ones). Their files are registered
+  // by name and size and read in place: the engine asks isaacLazyRanged whether a
+  // lazy file is one, and its reads of it come to isaacLazyPread at its own
+  // offsets. Their Lua goes to MEMFS as any mod's does. The index and the eager
+  // lane come from the Cache API (fetched again if the browser cleared them).
+  await stageOk('register packed mods', async () => {
+    if (!modsOn || !modDb) return 0;
+    let list = [];
+    try { list = (await listMods(modDb)).filter((x) => x.enabled !== false && isPacked(x)); } catch (e) { log(`  packed mods: ${e.message}`); }
+    if (!list.length) return 0;
+    packStore = hooks.packStore || createPackStore({ log });
+    packDownloader = hooks.packDownloader !== undefined ? hooks.packDownloader
+      : params.get('packbg') === '0' ? null : createPackDownloader({ store: packStore, log });
+    let waitTimer = null;
+    packedMods = createPackedMods({
+      store: packStore,
+      // a read the game is waiting on for more than a moment is shown (play.mjs)
+      onWait: (pending) => {
+        if (!hooks.onModPackWait) return;
+        if (pending && !waitTimer) waitTimer = setTimeout(() => { waitTimer = null; if (packedMods.stats.pending) hooks.onModPackWait(true); }, 700);
+        if (!pending) { if (waitTimer) { clearTimeout(waitTimer); waitTimer = null; } hooks.onModPackWait(false); }
+      },
+    });
+    cfg.isaacLazyRanged = (src) => packedMods.owns(src);
+    let n = 0;
+    for (const mod of list) {
+      const t0 = performance.now();
+      try {
+        const index = await packedIndex(packStore, mod);
+        await packedMods.add(mod.id, mod.packed.base, index);
+        let files = 0, bytes = 0;
+        for (const [src, size] of packedMods.paths(mod.id)) {
+          const pp = cstr(src);
+          try { if (m._isaac_fs_seed_lazy(pp, size)) { files += 1; bytes += size; } } finally { m._free(pp); }
+        }
+        let lua = 0;
+        for (const [rel, body] of await packedMods.lua(mod.id)) {
+          const at = `/mods/${mod.id}/${rel}`;
+          m.FS.mkdirTree(at.slice(0, at.lastIndexOf('/')));
+          m.FS.writeFile(at, body);
+          lua += 1;
+        }
+        n += 1;
+        log(`  ${mod.name} (${mod.id}): ${files} file(s) registered, read in place (${(bytes / 1048576).toFixed(1)} MB), ${lua} lua into MEMFS, ${(performance.now() - t0).toFixed(0)} ms`);
+      } catch (e) {
+        packedMods.remove(mod.id);
+        log(`  ${mod.name} (${mod.id}): not loaded, ${e.message}`);
+      }
+    }
+    const st = packStore.stats;
+    log(`  packed mods: ${n} of ${list.length}; packs from the cache ${st.cacheHits}, fetched ${st.fetched} (${(st.fetchedBytes / 1048576).toFixed(1)} MB)`);
+    // round 108: the rest of them, in the background from here on -- one at a time
+    // while the game boots (its own reads come first), two once the boot is over
+    if (n && packDownloader) { packDownloader.pace(1); packDownloader.start().catch((e) => log(`[mods] the background download: ${e.message}`)); }
+    return n;
+  });
+
+  // --- the host Lua's libc reads scripts through MEMFS: put them there
+  await stageOk('lua scripts into MEMFS', async () => {
+    // Round 102: and a mod that is part of the instance tree itself (a dist made
+    // for working on a large mod, scripts/recomp/rgon/tools/dev_dist.py) has its
+    // Lua there for the same reason. Fiend Folio has 1,855 files of it, so these
+    // are fetched a few at a time rather than one after another.
+    const wanted = index.filter(({ p: rel }) => rel.startsWith('resources/scripts/') || (rel.startsWith('mods/') && /\.lua$/i.test(rel)));
+    let n = 0, next = 0;
+    const worker = async () => {
+      while (next < wanted.length) {
+        const rel = wanted[next++].p;
+        const bytes = await fetchBytes(`/instance/${rel.split('/').map(encodeURIComponent).join('/')}`);
+        m.FS.mkdirTree('/' + rel.slice(0, rel.lastIndexOf('/')));
+        m.FS.writeFile('/' + rel, bytes);
+        n += 1;
+      }
+    };
+    await Promise.all(Array.from({ length: wanted.length > 64 ? 12 : 1 }, worker));
+    log(`  ${n} lua scripts written`);
+    return n;
+  });
+
+  // --- boot + main
+  done.bootRc = await stageOk('host boot (IAT + TEB + TLS + _initterm)', () => m._isaac_run_boot(1));
+  log(`  isaac_boot_init -> ${done.bootRc}`);
+  if (done.bootRc === null) throw new Error('boot trapped');
+  // Round 34: the shipping page waits for its Play button here (a user gesture for WebAudio).
+  if (hooks.beforeMain) await hooks.beforeMain(m);
+  // Under JSPI (round 25) _isaac_run_main returns a promise that settles when
+  // main returns; without it the call is synchronous. Both are awaited here.
+  done.mainRc = await stageOk('main @ 0x00931050', () => {
+    const r = m._isaac_run_main();
+    log(`  _isaac_run_main returned a ${r && typeof r.then === 'function' ? 'promise (JSPI)' : 'value (synchronous)'}`);
+    return r;
+  });
+  log(`  isaac_boot_call_main -> ${done.mainRc}`);
+  try { m._isaac_stub_report(); } catch (e) { log(`  stub report failed: ${e.message}`); }
+  try { m._isaac_heap_report(); } catch (e) { /* best effort */ }
+  log(`RESULT: ${done.mainRc === null ? 'main trapped' : 'main returned ' + done.mainRc}`);
+} catch (e) {
+  log(`RESULT: aborted: ${e.message}`);
+  done.error = e.message;
+}
+done.presented = presented;
+done.lazyReads = lazyReads;
+done.lazyBytes = lazyBytes;
+log(`  frames presented: ${presented}; lazy reads: ${lazyReads} files, ${(lazyBytes / 1048576).toFixed(1)} MB; scripted inputs delivered: ${inputsDelivered}, pending: ${timeline.length}`);
+logEl.textContent = window.isaacLog.slice(-12).join('\n');
+window.isaacDone = done;
